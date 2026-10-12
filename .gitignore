@@ -1,0 +1,4 @@
+build/
+build-host/
+tests/out/
+.DS_Store
