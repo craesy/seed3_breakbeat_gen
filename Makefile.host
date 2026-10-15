@@ -1,0 +1,29 @@
+# Host (macOS/Linux) build of the engine: tests and a command-line generator.
+#   make -f Makefile.host test   [MBB_SOX=/path/to/sox]
+#   make -f Makefile.host cli
+CXX      ?= clang++
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter
+ASSETS   ?= ../../makebreakbeat/lib
+ENGINE   := $(wildcard src/engine/*.cpp)
+BUILD    := build-host
+
+all: test cli
+
+$(BUILD)/host_test: tests/host_test.cpp $(ENGINE) $(wildcard src/engine/*.h) tests/host_io.h
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ tests/host_test.cpp $(ENGINE)
+
+$(BUILD)/mbb: tools/mbb_cli.cpp $(ENGINE) $(wildcard src/engine/*.h) tests/host_io.h
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ tools/mbb_cli.cpp $(ENGINE)
+
+test: $(BUILD)/host_test
+	@mkdir -p tests/out
+	./$(BUILD)/host_test $(ASSETS) tests/out
+
+cli: $(BUILD)/mbb
+
+clean:
+	rm -rf $(BUILD) tests/out
+
+.PHONY: all test cli clean
