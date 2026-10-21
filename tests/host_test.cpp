@@ -563,50 +563,61 @@ static void TestPlayer()
 }
 
 // LIVE mode. The test loop is a ramp whose L + R add up to the frame index,
-// so the output decodes back to the position the effects read from. A second
-// player that never uses LIVE runs alongside as the reference.
+// so the output decodes back to the position being read.
 static void TestLive(Engine& e)
 {
     std::printf("[live]\n");
-    const uint32_t       fpb = 3600, beats = 16, frames = fpb * (beats + 1), q16 = fpb / 4, ql = 4 * fpb;
-    std::vector<int16_t> ramp(frames * 2);
+    const uint32_t       fpb = 3600, beats = 16, frames = fpb * (beats + 1), ql = 4 * fpb;
+    std::vector<int16_t> ramp(frames * 2), ramp2(5 * fpb * 2);
     for(uint32_t i = 0; i < frames; i++)
     {
         ramp[2 * i]     = static_cast<int16_t>(i / 2);
         ramp[2 * i + 1] = static_cast<int16_t>((i + 1) / 2);
     }
-    Player ref, p;
-    for(Player* q : {&ref, &p})
+    for(uint32_t i = 0; i < 5 * fpb; i++) // another version of a quarter: 30000 + i
     {
-        q->Init(48000.f);
-        q->buf[q->ClaimFree()] = {ramp.data(), frames, double(fpb), int(beats), 200};
-        q->Publish(0, true);
+        ramp2[2 * i]     = static_cast<int16_t>((30000 + i) / 2);
+        ramp2[2 * i + 1] = static_cast<int16_t>((30001 + i) / 2);
     }
-    std::vector<float>    pv, rv; // output L
-    std::vector<double>   dec;    // decoded read position
-    std::vector<uint32_t> trn;    // transport position
+    Player p;
+    p.Init(48000.f);
+    p.buf[p.ClaimFree()] = {ramp.data(), frames, double(fpb), int(beats), 200};
+    p.Publish(0, true);
+    std::vector<double>   dec; // decoded read position
+    std::vector<uint32_t> trn; // transport position in the playing buffer
+    std::vector<int>      act; // playing buffer
     auto run = [&](uint32_t n) {
-        pv.clear(), rv.clear(), dec.clear(), trn.clear();
+        dec.clear(), trn.clear(), act.clear();
         for(uint32_t i = 0; i < n; i++)
         {
-            float l, r, rl, rr;
-            ref.Process(&rl, &rr, 1, 1.f);
+            float l, r;
             p.Process(&l, &r, 1, 1.f);
-            const uint32_t s = p.a_or_b() ? p.pos_a() : p.pos_b();
-            pv.push_back(l);
-            rv.push_back(rl);
+            const uint32_t s = p.a_or_b() ? p.pos_a() : p.pos_b(), bf = p.buf[p.active()].frames;
             dec.push_back((static_cast<double>(l) + r) * 32768.0);
-            trn.push_back((s + frames - 1) % frames);
+            trn.push_back((s + bf - 1) % bf);
+            act.push_back(p.active());
         }
     };
     auto to = [&](uint32_t pos) { // run until the transport is at pos
         while(trn.empty() || trn.back() != pos)
             run(1);
     };
-
-    // all clean: bit identical to the original player
-    run(48000);
-    CHECK(std::memcmp(pv.data(), rv.data(), pv.size() * 4) == 0, "LIVE clean changed the output");
+    // index of the first sample playing buffer `b`
+    auto start_of = [&](int b) {
+        size_t i = 0;
+        while(i < act.size() && act[i] != b)
+            i++;
+        return i;
+    };
+    // decoded == offset + transport from sample a on (until n), after the crossfades
+    auto reads = [&](size_t a, size_t n, double offset) {
+        int bad = 0;
+        for(size_t i = a + 7200; i < std::min(n, dec.size()); i++)
+            bad += std::fabs(dec[i] - offset - trn[i]) > 3; // the readers' crossfade may be 1 frame apart
+        if(bad)
+            std::printf("  (%u: %.2f vs %.0f + %u)\n", unsigned(a + 7200), dec[a + 7200], offset, trn[a + 7200]);
+        return bad;
+    };
 
     // the quarter being played (for the quarter LEDs)
     int wrong = 0;
@@ -617,67 +628,37 @@ static void TestLive(Engine& e)
     }
     CHECK(wrong == 0, "playing_quarter wrong for %d samples", wrong);
 
-    // a change waits for the next 16th
-    to(ql + 3 * q16 + q16 / 2);
-    p.SetQuarterFx(1, Player::kReverse);
-    run(q16);
-    size_t first = 0;
-    while(first < pv.size() && pv[first] == rv[first])
-        first++;
-    // (a jump's crossfade starts on the old read head: 1 sample later)
-    CHECK(first < pv.size() && trn[first] % q16 <= 1, "reverse started at %u (16th %u)",
-          first < trn.size() ? trn[first] : 0, q16);
-    p.SetQuarterFx(1, Player::kClean);
+    // Solo: quarter 2 on its own, from the next bar (half way through beat 6)
+    uint32_t s0, s1;
+    Player::Quarter(p.buf[0], 1, s0, s1);
+    CHECK(s0 == ql && s1 == 2 * ql, "quarter 2 is %u..%u", s0, s1);
+    to(5 * fpb + fpb / 2);
+    p.buf[2] = {ramp.data() + 2 * s0, 5 * fpb, double(fpb), 4, 200};
+    p.Publish(2, false, 4);
+    run(10 * fpb);
+    size_t i0 = start_of(2);
+    CHECK(i0 > 0 && i0 < act.size() && trn[i0 - 1] == 8 * fpb - 1 && trn[i0] == 0,
+          "solo started after %u (want %u)", i0 > 0 && i0 < act.size() ? trn[i0 - 1] : 0, 8 * fpb - 1);
+    CHECK(reads(i0, i0 + ql, s0) == 0 && reads(i0 + ql, i0 + 2 * ql, s0) == 0 && trn[i0 + ql] == 0,
+          "solo does not loop quarter 2");
 
-    // each effect on the 2nd quarter, over one whole loop
-    static const char* kName[5] = {"clean", "stutter", "reverse", "half-time", "tape stop"};
-    for(int fx = 1; fx < 5; fx++)
-    {
-        to(beats * fpb - 1);
-        p.SetQuarterFx(1, fx);
-        run(beats * fpb);
-        p.SetQuarterFx(1, Player::kClean);
-        // trn[i] == i here; the rest of the loop is untouched
-        bool same = true;
-        for(uint32_t i = 0; i < pv.size(); i++)
-            if(i < ql || i >= 2 * ql + 600)
-                same = same && pv[i] == rv[i];
-        CHECK(same, "%s: changed audio outside its quarter", kName[fx]);
-        auto frac = [&](uint32_t a, uint32_t b, double slope) {
-            int ok = 0;
-            for(uint32_t i = a; i + 1 < b; i++)
-                ok += std::fabs(dec[i + 1] - dec[i] - slope) < 0.05;
-            return ok / double(b - a - 1);
-        };
-        double f = 0;
-        if(fx == Player::kStutter)
-        {
-            // plain for 2 beats, then beat 4 in 8ths, then 16ths
-            const uint32_t a = ql + 3 * fpb;
-            f                = frac(ql + 100, ql + 2 * fpb, 1);
-            int per = 0, n = 0;
-            for(uint32_t i = ql + 2 * fpb + 200; i + fpb / 2 < ql + 3 * fpb; i++, n++)
-                per += std::fabs(dec[i + fpb / 2] - dec[i]) < 0.5 && dec[i] >= a - 1 && dec[i] < a + fpb / 2 + 1;
-            for(uint32_t i = ql + 3 * fpb + 200; i + fpb / 4 < 2 * ql; i++, n++)
-                per += std::fabs(dec[i + fpb / 4] - dec[i]) < 0.5 && dec[i] >= a - 1 && dec[i] < a + fpb / 4 + 1;
-            CHECK(per >= 0.95 * n, "stutter: %d/%d periodic", per, n);
-        }
-        if(fx == Player::kReverse)
-            f = frac(ql, 2 * ql, -1);
-        if(fx == Player::kHalf)
-            f = frac(ql, 2 * ql, 0.5);
-        if(fx == Player::kTapeStop)
-        {
-            const uint32_t mid = ql + ql / 2;
-            f                  = std::fabs(dec[mid + 1] - dec[mid] - 0.5) < 0.02;
-            float tail         = 0;
-            for(uint32_t i = 2 * ql - 60; i < 2 * ql; i++)
-                tail = std::max(tail, std::fabs(pv[i]));
-            CHECK(tail < 0.02f, "tape stop not silent at the end: %f", tail);
-        }
-        std::printf("  %-9s %3.0f%%\n", kName[fx], f * 100);
-        CHECK(f >= 0.85, "%s: %.0f%% as expected", kName[fx], f * 100);
-    }
+    // another version: on the next beat, at the same place
+    to(fpb + fpb / 2);
+    p.buf[3] = {ramp2.data(), 5 * fpb, double(fpb), 4, 200};
+    p.Publish(3, false);
+    run(2 * fpb);
+    i0 = start_of(3);
+    CHECK(i0 > 0 && i0 < act.size() && trn[i0 - 1] == 2 * fpb - 1 && trn[i0] == 2 * fpb,
+          "version switched at %u", i0 < act.size() ? trn[i0] : 0);
+    CHECK(reads(i0 + 200 - 7200, act.size(), 30000) == 0, "version 2 not playing");
+
+    // back to the whole loop: at the end of the solo, from the top
+    p.Publish(0, false, 4);
+    run(6 * fpb);
+    i0 = start_of(0);
+    CHECK(i0 > 0 && i0 < act.size() && trn[i0 - 1] == 4 * fpb - 1 && trn[i0] == 0,
+          "loop resumed after %u", i0 > 0 && i0 < act.size() ? trn[i0 - 1] : 0);
+    CHECK(reads(i0, act.size(), 0) == 0, "loop not playing from the top");
 
     // Regenerating a quarter: a new 16-beat loop at 160 bpm, then quarters
     // 2 and 4 made again and spliced in.
@@ -698,6 +679,12 @@ static void TestLive(Engine& e)
     GenResult b = e.Generate(qp, part.data() + cap, cap / 2);
     CHECK(a.ok && b.ok && std::memcmp(part.data(), part.data() + cap, old.fpb * 4) != 0,
           "start_beat did not change the first chop");
+    // background versions can be given up part way
+    volatile bool stop = true;
+    Hooks         sh;
+    sh.stop = &stop;
+    CHECK(!e.Generate(qp, part.data(), cap, &sh).ok, "stop flag ignored");
+    CHECK(e.Generate(qp, part.data(), cap).ok, "generate after a stop failed");
     float max_step = 0;
     for(int q : {1, 3})
     {
@@ -740,12 +727,14 @@ static void TestLive(Engine& e)
     std::printf("  splice: largest step at a seam %.0f (audio %.0f)\n", max_step, own);
     CHECK(max_step <= own, "splice seam step %.0f > %.0f", max_step, own);
 
-    // A real beat played with the pots turned and quarters regenerated at
-    // random: no clicks, NaNs or overloads. Clicks are measured as the
-    // largest step between samples.
-    const uint32_t       total = static_cast<uint32_t>(old.fpb * 96);
+    // A real beat with quarters soloed, switched between versions and kept
+    // or dropped at random, as the firmware does: no clicks, NaNs or
+    // overloads. Clicks are measured as the largest step between samples.
+    const uint32_t       big = SecToFrames(20);
+    std::vector<int16_t> mem[2] = {std::vector<int16_t>(big * 2), std::vector<int16_t>(big * 2)};
+    std::copy(beat.begin(), beat.begin() + 2 * old.frames, mem[0].begin());
+    const uint32_t       total = static_cast<uint32_t>(old.fpb * 128);
     std::vector<int16_t> demo(total * 2);
-    std::vector<int16_t> mem[2] = {beat, std::vector<int16_t>(cap * 2)};
     Player               q;
     q.Init(48000.f);
     q.buf[0]      = old;
@@ -756,32 +745,83 @@ static void TestLive(Engine& e)
         rng = rng * 1664525u + 1013904223u;
         return (rng >> 8) % n;
     };
+    const int      Q = old.loop_beats / 4;
+    const uint32_t slot_len = static_cast<uint32_t>((Q + 2) * old.fpb) + 64;
+    int            solo = -1, full = 0, pool = 1, n_slots = 0, shown = 0, solos = 0, switches = 0, kept = 0;
+    uint32_t       ss0 = 0, ss1 = 0, base = 0, slot_frames[8] = {};
+    auto           slot = [&](int k) {
+        PlayBuf b    = q.buf[full];
+        b.loop_beats = Q;
+        if(k == 0)
+        {
+            b.data   = mem[full].data() + 2 * ss0;
+            b.frames = std::min(static_cast<uint32_t>((Q + 1) * b.fpb), b.frames - ss0);
+        }
+        else
+        {
+            b.data   = mem[pool].data() + 2 * (base + (k - 1) * slot_len);
+            b.frames = slot_frames[k];
+        }
+        return b;
+    };
     float    step[2] = {0, 0}, prev[2] = {0, 0}, peak = 0;
     bool     finite  = true;
-    int      regens  = 0;
     uint32_t next    = static_cast<uint32_t>(old.fpb * 32); // two plain loops first
     for(uint32_t i = 0; i < total; i++)
     {
         if(i == next)
         {
-            if(rnd(3) || q.pending() >= 0)
-                q.SetQuarterFx(rnd(4), rnd(5));
-            else
+            const int act_b = q.active();
+            if(solo < 0 && q.pending() < 0 && act_b < 2)
             {
-                const int      quarter = rnd(4), f = 1 - q.active();
-                const PlayBuf& cur     = q.buf[q.active()];
-                uint32_t       s0, s1;
-                Player::Quarter(cur, quarter, s0, s1);
-                qp.start_beat = quarter * cur.loop_beats / 4.0;
-                qp.seed       = 100 + regens++;
-                GenResult r   = e.Generate(qp, mem[f].data() + 2 * s0, cap - s0);
-                CHECK(r.ok, "random regen");
-                Player::Splice(cur, mem[f].data(), s0, s1, r.frames);
-                q.buf[f]      = cur;
-                q.buf[f].data = mem[f].data();
-                q.Publish(f, false);
+                solo = rnd(4), full = act_b, pool = 1 - act_b;
+                Player::Quarter(q.buf[full], solo, ss0, ss1);
+                base    = q.buf[full].frames;
+                n_slots = 1 + std::min<int>(7, (big - base) / slot_len);
+                for(int k = 1; k < n_slots; k++)
+                {
+                    qp.start_beat  = solo * Q;
+                    qp.seed        = 100 + solos * 8 + k;
+                    GenResult r    = e.Generate(qp, mem[pool].data() + 2 * (base + (k - 1) * slot_len), slot_len);
+                    slot_frames[k] = r.frames;
+                    CHECK(r.ok && r.frames >= (Q + 1) * old.fpb, "version %d: %u frames", k, r.frames);
+                }
+                q.buf[2] = slot(0);
+                q.Publish(2, false, 4);
+                shown = 0;
+                solos++;
             }
-            next += static_cast<uint32_t>(old.fpb * (0.1 + rnd(100) * 0.006));
+            else if(solo >= 0)
+            {
+                const int what = rnd(5);
+                if(what < 3)
+                {
+                    shown        = rnd(n_slots);
+                    const bool in = act_b >= 2;
+                    const int  ab = in && act_b == 2 ? 3 : 2;
+                    q.buf[ab]     = slot(shown);
+                    q.Publish(ab, false, in ? 1 : 4);
+                    switches++;
+                }
+                else if(what == 3 && shown > 0)
+                {
+                    int16_t* dst = mem[pool].data();
+                    const uint32_t m = std::min(slot_frames[shown], q.buf[full].frames - ss0);
+                    std::memcpy(dst + 2 * ss0, slot(shown).data, m * 4);
+                    Player::Splice(q.buf[full], dst, ss0, ss1, m);
+                    q.buf[pool]      = q.buf[full];
+                    q.buf[pool].data = dst;
+                    q.Publish(pool, false, 4);
+                    solo = -1;
+                    kept++;
+                }
+                else
+                {
+                    q.Publish(full, false, 4);
+                    solo = -1;
+                }
+            }
+            next += static_cast<uint32_t>(old.fpb * (0.3 + rnd(100) * 0.02));
         }
         float l, r;
         q.Process(&l, &r, 1, 1.f);
@@ -797,10 +837,10 @@ static void TestLive(Engine& e)
         }
     }
     const float limit = std::max(step[0], own / 32768) + 0.03f;
-    std::printf("  random pots + %d new quarters: largest step %.3f (plain loop %.3f), peak %.3f\n", regens,
-                step[1], step[0], peak);
-    CHECK(finite && peak < 1.2f && step[1] <= limit && regens >= 5,
-          "random: step %.3f > %.3f or peak %.3f (%d regens)", step[1], limit, peak, regens);
+    std::printf("  random: %d solos, %d version changes, %d kept: largest step %.3f (plain loop %.3f), peak %.3f\n",
+                solos, switches, kept, step[1], step[0], peak);
+    CHECK(finite && peak < 1.2f && step[1] <= limit && solos >= 4 && switches >= 8 && kept >= 2,
+          "random: step %.3f > %.3f or peak %.3f", step[1], limit, peak);
     std::string path = g_out + "/live_demo.wav";
     FileWriter  w(path.c_str());
     WriteWav16(w, demo.data(), total);

@@ -8,28 +8,8 @@ namespace mbb
 {
 namespace
 {
-constexpr int   kFade     = 96; // LIVE mode crossfade, samples (2 ms)
+constexpr int   kFade     = 96; // buffer swap crossfade, samples (2 ms)
 constexpr float kFadeStep = 1.0f / kFade;
-
-// a rounded down to a multiple of b
-double Floor(double a, double b)
-{
-    return std::floor(a / b) * b;
-}
-
-// Linear interpolation at a (wrapped) fractional frame position.
-void ReadAt(const PlayBuf& b, double pos, float& l, float& r)
-{
-    pos -= Floor(pos, b.frames);
-    uint32_t i = static_cast<uint32_t>(pos);
-    if(i >= b.frames)
-        i = 0;
-    const uint32_t j = i + 1 < b.frames ? i + 1 : 0;
-    const float    f = static_cast<float>(pos - i);
-    const int16_t *a = b.data + 2 * i, *c = b.data + 2 * j;
-    l = a[0] + f * (c[0] - a[0]);
-    r = a[1] + f * (c[1] - a[1]);
-}
 } // namespace
 
 void Player::Init(float sr)
@@ -67,20 +47,21 @@ void Player::TogglePlay()
 int Player::ClaimFree()
 {
     pending_ = -1;
-    return active_ < 0 ? 0 : 1 - active_;
+    return active_ == 0 ? 1 : 0;
 }
 
-void Player::Publish(int idx, bool auto_play)
+void Player::Publish(int idx, bool auto_play, int sync)
 {
     const bool first = active_ < 0;
     pending_         = idx;
+    sync_            = sync;
     if(first && auto_play && !playing_)
         TogglePlay();
 }
 
 void Player::Tick()
 {
-    if(pending_ >= 0)
+    if(pending_ >= 0 && (active_ < 0 || sync_ <= 1 || (lattice_ + 1) % sync_ == 0))
     {
         // load_track: both readers move to the new buffer and keep their
         // position (scaled to the new tempo so they stay on the same beat).
@@ -91,13 +72,14 @@ void Player::Tick()
             const PlayBuf& o = buf[active_];
             const PlayBuf& n = buf[nb];
             const double   r = n.fpb / o.fpb;
+            swap_pos_        = a_or_b_ ? pos_a_ : pos_b_;
             pos_a_           = static_cast<uint32_t>(pos_a_ * r) % n.frames;
             pos_b_           = static_cast<uint32_t>(pos_b_ * r) % n.frames;
             // A different loop length would leave the bar count misaligned
             // (norns has one global length); restart the count instead.
             if(n.loop_beats != o.loop_beats)
                 lattice_ = -1;
-            if(n.fpb == o.fpb) // e.g. a new quarter (LIVE): 2 ms crossfade
+            if(n.fpb == o.fpb) // e.g. LIVE quarters: 2 ms crossfade from the old buffer
             {
                 swap_old_    = o.data;
                 swap_frames_ = o.frames;
@@ -160,76 +142,6 @@ void Player::Splice(const PlayBuf& old, int16_t* dst, uint32_t s0, uint32_t s1, 
         std::memcpy(dst + 2 * (s1 + X), old.data + 2 * (s1 + X), (old.frames - s1 - X) * 4);
 }
 
-// LIVE: maps loop position p through quarter q's effect and reads the loop.
-void Player::Live(const PlayBuf& b, uint32_t p, int q, float& l, float& r)
-{
-    const double fpb = b.fpb, ql = fpb * b.loop_beats / 4, q0 = q * ql;
-    const double u    = std::max(0.0, p - q0); // position in the quarter
-    double       x    = p;
-    float        gain = 1;
-    switch(fx_[q])
-    {
-        case kStutter:
-            if(u >= ql / 2)
-            {
-                const double a = q0 + ql * 0.75, len = u < ql * 0.75 ? fpb / 2 : fpb / 4;
-                x              = a + (p - a) - Floor(p - a, len);
-            }
-            break;
-        case kReverse: x = 2 * Floor(p, fpb) + fpb - 1 - p; break;
-        case kHalf:
-        {
-            const double s0 = q0 + Floor(u, 2 * fpb);
-            x               = s0 + (p - s0) * 0.5;
-            break;
-        }
-        case kTapeStop:
-            x    = q0 + u - u * u / (2 * ql);
-            gain = u < 0.75 * ql ? 1 : static_cast<float>((ql - u) / (0.25 * ql));
-            break;
-        default: break;
-    }
-
-    // Jumps (repeats, reversed chunks, loop restarts) are crossfaded: the old
-    // read head keeps going while it fades out.
-    const double n = b.frames;
-    x -= Floor(x, n);
-    double d = x - prev_;
-    if(d > n / 2)
-        d -= n;
-    else if(d < -n / 2)
-        d += n;
-    if(settle_)
-    {
-        vel_    = d; // first step after a jump: learn the new speed
-        settle_ = false;
-    }
-    else if(std::fabs(d - vel_) > 1.5)
-    {
-        fade_pos_ = prev_;
-        fade_vel_ = vel_;
-        fade_n_   = kFade;
-        settle_   = true;
-    }
-    else
-        vel_ = d;
-    prev_ = x;
-
-    ReadAt(b, x, l, r);
-    if(fade_n_ > 0)
-    {
-        fade_pos_ += fade_vel_;
-        float fl, fr;
-        ReadAt(b, fade_pos_, fl, fr);
-        const float w = fade_n_-- * kFadeStep;
-        l += w * (fl - l);
-        r += w * (fr - r);
-    }
-    live_gain_ += 0.02f * (gain - live_gain_);
-    l *= live_gain_;
-    r *= live_gain_;
-}
-
 void Player::Process(float* left, float* right, size_t n, float vol_target)
 {
     constexpr float k = 1.0f / 32768.0f;
@@ -266,42 +178,17 @@ void Player::Process(float* left, float* right, size_t n, float vol_target)
             l             = (xf_ * a[0] + (1 - xf_) * c[0]) * g;
             r             = (xf_ * a[1] + (1 - xf_) * c[1]) * g;
 
-            // LIVE: effects change on 16th notes; a quarter is loop_beats 16ths
-            const int32_t q16 = static_cast<int32_t>(p / (b.fpb * 0.25));
-            if(q16 != last_q_)
-            {
-                last_q_ = q16;
-                for(int j = 0; j < 4; j++)
-                    fx_[j] = req_[j];
-            }
-            const int  q  = std::min(3, static_cast<int>(q16 / std::max(1, b.loop_beats)));
-            const bool on = fx_[q] != kClean;
-            cur_q_        = static_cast<int8_t>(q);
-            if(on || live_mix_ > 0)
-            {
-                if(live_mix_ == 0) // starting from the plain loop at p
-                {
-                    prev_      = p - 1.0;
-                    vel_       = 1;
-                    settle_    = false;
-                    fade_n_    = 0;
-                    live_gain_ = 1;
-                }
-                float ll, lr;
-                Live(b, p, q, ll, lr);
-                live_mix_ = on ? std::min(1.f, live_mix_ + kFadeStep)
-                                : std::max(0.f, live_mix_ - kFadeStep);
-                l += live_mix_ * (ll * g - l);
-                r += live_mix_ * (lr * g - r);
-            }
+            const uint32_t q16 = static_cast<uint32_t>(p / (b.fpb * 0.25));
+            cur_q_             = static_cast<int8_t>(std::min<uint32_t>(3, q16 / std::max(1, b.loop_beats)));
             if(swap_n_ > 0)
             {
                 const float w = swap_n_-- * kFadeStep;
-                if(p < swap_frames_)
+                if(swap_pos_ < swap_frames_)
                 {
-                    l += w * (swap_old_[2 * p] * g - l);
-                    r += w * (swap_old_[2 * p + 1] * g - r);
+                    l += w * (swap_old_[2 * swap_pos_] * g - l);
+                    r += w * (swap_old_[2 * swap_pos_ + 1] * g - r);
                 }
+                swap_pos_++;
             }
         }
         if(aud_pos_ < aud_n_)

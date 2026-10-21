@@ -10,9 +10,9 @@ SuperCollider plays the result. None of that can run on a microcontroller.
 This project reimplements all of it in plain C++ with no OS, no heap and no
 external tools, then checks the result against the original sample-for-sample.
 
-> Runs on a Seed3: generating, playback, CHOP mode and LIVE quarters have
-> been used on hardware. The engine and player also pass host tests. The USB
-> log shows what it is doing.
+> Runs on a Seed3: generating, playback and CHOP mode have been used on
+> hardware. LIVE mode's quarter solo is new and so far only tested on the host.
+> The engine and player pass host tests. The USB log shows what it is doing.
 
 ## Hardware
 
@@ -22,7 +22,7 @@ external tools, then checks the result against the original sample-for-sample.
 | D16 | button to GND | **Play / stop** (norns K3) |
 | D17 | button to GND | **Next break** (hold ≥ 0.6 s: **LIVE mode**) |
 | D18 | button to GND | **Previous saved beat** (hold: next) |
-| D19–D22 | 10 k pots (3V3 / AGND) | **Currently switched off** (`kPots` in `src/main.cpp`). When on: `use_pots = 1` sets tempo, beats, chaos, volume; LIVE mode effects always |
+| D19–D22 | 10 k pots (3V3 / AGND) | `use_pots = 1`: tempo, beats, chaos, volume. LIVE mode: pick a version of a soloed quarter (always). `kPots = false` in `src/main.cpp` stops reading them |
 | D23, D24, D25, D28 | 3V3 → LED → resistor (e.g. 330 Ω) → pin (lit when the pin is low; for LEDs to GND set `kQledLow = false`) | **Quarter LEDs:** lit while quarter 1, 2, 3, 4 of the loop plays |
 | D1–D6 | micro-SD socket | D1 DAT3, D2 DAT2, D3 DAT1, D4 DAT0, D5 CMD, D6 CLK |
 | Audio out L/R | | stereo out, 48 kHz |
@@ -50,8 +50,9 @@ wiring of the `MyProjects/test` project.
 
 **Quarter LEDs (D23, D24, D25, D28):** the loop is split into 4 quarters (one
 bar each in a 16-beat loop). The LED of the quarter being played is lit, so they
-step 1 → 2 → 3 → 4 round the loop. All are off when stopped. In LIVE mode, the
-LED of a quarter being made again blinks fast.
+step 1 → 2 → 3 → 4 round the loop. All are off when stopped. While a quarter
+is soloed (LIVE mode), only its LED is lit; it blinks fast while the version
+its pot asks for is still being made.
 
 ## CHOP mode: choosing what goes into the beat
 
@@ -95,51 +96,60 @@ into 4 quarters; with a 16-beat loop, each quarter is one bar.
 | D17 | D21 | 3rd |
 | D18 | D22 | 4th |
 
-**Tap a button** to make its quarter again:
-- The new quarter uses new random chops, stutters, reverses and so on.
-- Tempo and length stay the same, and the rest of the loop is untouched.
-- It carries on from where the quarter starts. The chops continue from that
-  point in the break, and kicks and snares fall on the same bar positions as in
-  a whole beat.
-- Making a quarter takes about a second (the LED and that quarter's LED blink). It swaps in on the
-  next beat, crossfaded over 5 ms at the quarter's edges and 2 ms at the swap.
+**Tap a button** to solo its quarter:
+- The quarter starts looping on its own at the next bar (or, for quarters
+  shorter than a bar, at the end of one).
+- Versions of every quarter are made in the background as soon as a loop
+  plays (at boot, and again after each new beat or break), one at a time:
+  new random chops, stutters, reverses and so on, same tempo and length.
+  Each carries on from where the quarter starts in the break, with kicks and
+  snares on the same bar positions as in a whole beat. One takes about a
+  second, so all are ready about half a minute after a new beat.
+- They are kept in RAM (the spare 45 s play buffer), so they are lost at
+  power-off and replaced when a new beat is made. Background work pauses
+  whenever a button needs the engine, so buttons stay responsive.
 
-**Turn a pot** (pots are currently switched off, so quarters stay clean; set
-`kPots = true` in `src/main.cpp` to use them) to put an effect on its quarter, for every loop until you change
-it. Each fifth of the pot's travel is one effect:
+**Turn that quarter's pot** to step through the versions:
+- Fully left is the quarter as it was; each step to the right is another
+  version. The bank holds up to 28 shared round-robin between the quarters:
+  at 177 bpm a 16-beat loop gets 5–6 per quarter, 32 beats about 3, 48
+  beats 1–2. If there is room for fewer than 4, the soloed quarter takes
+  them all (64 beats: about 3).
+- A soloed quarter's versions are made first.
+- A new version swaps in on the next beat, at the same place in the quarter,
+  crossfaded over 2 ms.
+- If the version isn't made yet, its LED blinks fast and it is made next.
+- The pot does nothing until you turn it, so an unconnected pot can't change
+  versions by drifting.
 
-| Pot, left → right | Effect on the quarter |
-|---|---|
-| 0–20% | clean |
-| 20–40% | **stutter fill:** the 2nd half repeats the start of the quarter's last beat in 8ths, then 16ths |
-| 40–60% | **reverse:** every beat plays backwards |
-| 60–80% | **half-time:** half speed (an octave down), restarting every 2 beats |
-| 80–100% | **tape stop:** slows to a halt by the end of the quarter |
-
-- Effects change on the next 16th note, and jumps are crossfaded over 2 ms.
-- A pot does nothing until you turn it after entering LIVE mode. Every quarter
-  starts clean, and a pot that isn't connected can't switch effects on by
-  drifting.
+**Tap the same button again** to go back to the whole loop, with the version
+you picked spliced in (5 ms crossfades at the quarter's edges). It swaps back at
+the next bar, from the start of the loop. Tapping another quarter's button
+does the same, then solos that quarter.
 
 Hold a button for ≥ 0.6 s:
-- **D15:** generate a whole new beat. The pot effects keep running on it.
+- **D15:** generate a whole new beat (a solo is kept first).
 - **D16:** play / stop.
-- **D17:** leave LIVE mode. The effects switch off.
-- **D18:** undo / redo. Swaps back to the loop as it was before the last new
-  quarter or beat. Hold again to swap forward.
+- **D17:** leave LIVE mode (a solo is kept first).
+- **D18:** while soloing: back to the whole loop as it was. Otherwise undo /
+  redo: swaps back to the loop as it was before the last kept version or new
+  beat. Hold again to swap forward. Soloing doesn't clear the undo step. A
+  kept version's slot is remade with a fresh version.
 
-**Pots:**
-- The pots set effects even with `use_pots = 0`.
+**Notes:**
+- The loop's beats must divide by 4 (e.g. 16, 32, 64). With the default 16
+  beats a quarter is one bar; `beats = 64` makes 16-bar loops with 4-bar
+  quarters.
 - In LIVE mode the pots don't set tempo, beats, chaos or volume. Those keep the
-  values they had when you entered. New quarters and a D15 hold use them.
-- When you leave, the volume jumps to D22's position.
+  values they had when you entered. New versions and a D15 hold use them.
+  When you leave, the volume jumps to D22's position.
 
 **USB log:**
-- Every change is printed, e.g. `live: quarter 2 reverse` and `new quarter 3 in 812 ms`.
+- Every change is printed, e.g. `versions: room for 23`,
+  `quarter 2 version 3 in 812 ms`, `solo quarter 2 (6 versions)` and
+  `solo: kept version 3`.
 - In LIVE mode the log also prints the pot positions (0–100) whenever one
   moves, e.g. `pots D19 3 D20 51 D21 98 D22 60`.
-- **Pot noise:** readings are smoothed, and an effect only changes once the pot
-  is 4% past its fifth.
 - **Pot not responding:** if it stays near 60 while you turn it, its wiper or
   3V3/GND isn't connected.
 
@@ -208,12 +218,14 @@ The firmware has to fit the Seed's 128 KB internal flash, so both libDaisy and
 the project are built with `-Os`, and the project also with link-time
 optimisation (`-flto`). A libDaisy built at the default `-O3` won't fit. The
 `lto-wrapper: warning: Options to Xassembler do not match` message is harmless:
-it only affects assembler listing files.
+it only affects assembler listing files. `src/main.cpp` also stubs out
+libDaisy's USB host and UART drivers, which this firmware doesn't use; that
+saves about 9 KB.
 
 | | used | of |
 |---|---|---|
-| FLASH | 125,752 B | 131,072 B (95.9%) |
-| SRAM (AXI/D2) | 247,996 B | 524,288 B |
+| FLASH | 122,112 B | 131,072 B (93.2%) |
+| SRAM (AXI/D2) | 243,896 B | 524,288 B |
 | SDRAM | 66,280,000 B | 67,108,864 B: 49.0 MB engine + 2 × 45 s play buffers |
 
 **USB log:** connect to the Seed's USB serial port (for example
@@ -310,14 +322,16 @@ The host tests check:
   - beats use only the selected chops and still have the right length;
   - equal chops cover the whole break.
 - LIVE mode:
-  - with every quarter clean, the output is identical to the original;
-  - changes wait for the next 16th note;
-  - every effect reads its quarter at the right speed and direction and leaves
-    the rest of the loop unchanged;
   - the quarter being played (for the quarter LEDs) is right on every sample;
-  - a new quarter replaces only its quarter, with smooth seams. Starting a
+  - a solo starts on the next bar and loops just its quarter; a new version
+    swaps in on the next beat at the same place; going back waits for the end
+    of the quarter and restarts the whole loop;
+  - a kept version replaces only its quarter, with smooth seams. Starting a
     beat part-way changes its first chop;
-  - a beat with pots turned and quarters made again at random has no clicks.
+  - a real beat with quarters soloed, versions switched and kept or dropped
+    at random has no clicks;
+  - a generation stopped part-way (for background versions) fails cleanly,
+    and the next one still works.
   - The random run is written to `tests/out/live_demo.wav`.
 
 `tools/ab_run.sh` runs the original `dnb.lua` itself, with the port's PCG32 RNG
@@ -352,5 +366,5 @@ write it to SD. Audio keeps playing while it generates.
 - **Loops:** up to 40 s at the break's tempo and 45 s at the output tempo.
   `beats` is reduced to fit.
 - **Saved beats:** up to 512 in `/MBB/OUT`.
-- **Memory:** uses all but about 0.8 MB of SDRAM, and only about 5.2 KB of flash is left (about 0.9 KB with the pots on).
+- **Memory:** uses all but about 0.8 MB of SDRAM, and about 8.9 KB of flash is left.
   Keep everything at `-Os`.

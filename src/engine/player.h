@@ -41,9 +41,11 @@ class Player
     // Returns a buffer that is neither playing nor queued and cancels any
     // queued swap, so it is safe to fill while Process() keeps running.
     int ClaimFree();
-    // Queues `idx` to replace the playing buffer on the next beat. The very
-    // first buffer starts immediately (and starts playback if auto_play).
-    void Publish(int idx, bool auto_play);
+    // Queues `idx` to replace the playing buffer on the next beat (with
+    // sync > 1: the next beat that is a multiple of `sync` beats from the
+    // last loop-length change). The very first buffer starts immediately (and
+    // starts playback if auto_play).
+    void Publish(int idx, bool auto_play, int sync = 1);
     // One-shot preview of a chop (interleaved stereo float, e.g. part of
     // Engine::source()), mixed over the loop. Not part of the original.
     void Audition(const float* frames, uint32_t n)
@@ -54,18 +56,7 @@ class Player
     }
     void StopAudition() { aud_n_ = 0; }
 
-    // ---- LIVE mode (not part of the original): an effect on each quarter
-    // of the loop, changed on the next 16th note. See README "LIVE mode".
-    enum QuarterFx
-    {
-        kClean,
-        kStutter,  // 2nd half: the start of the last beat in 8ths, then 16ths
-        kReverse,  // every beat backwards
-        kHalf,     // half speed, restarting every 2 beats
-        kTapeStop, // slows to a halt over the quarter
-    };
-    void SetQuarterFx(int q, int fx) { req_[q] = static_cast<uint8_t>(fx); }
-    int  quarter_fx(int q) const { return req_[q]; }
+    // ---- LIVE mode (not part of the original), see README "LIVE mode".
     // Quarter (0..3) of the loop being played, -1 before the first beat.
     int playing_quarter() const { return cur_q_; }
     // Frames [s0, s1) of quarter q (0..3) of a loop.
@@ -75,7 +66,8 @@ class Player
     // audio must run at least 5 ms past s1; it is kept if it reaches the end.
     static void Splice(const PlayBuf& old, int16_t* dst, uint32_t s0, uint32_t s1, uint32_t n);
 
-    PlayBuf buf[2];
+    // 0, 1: loops (ClaimFree); 2, 3: free for the caller (LIVE: one quarter)
+    PlayBuf buf[4];
 
     int  active() const { return active_; }
     int  pending() const { return pending_; }
@@ -91,22 +83,14 @@ class Player
 
   private:
     void Tick();
-    void Live(const PlayBuf& b, uint32_t p, int q, float& l, float& r);
-
-    volatile uint8_t req_[4] = {};
-    uint8_t          fx_[4]  = {};
-    int32_t          last_q_ = -1;
-    volatile int8_t  cur_q_  = -1;
-    double           prev_ = 0, vel_ = 1, fade_pos_ = 0, fade_vel_ = 0;
-    int              fade_n_   = 0;
-    bool             settle_   = true;
-    float            live_mix_ = 0, live_gain_ = 1;
-    const int16_t*   swap_old_ = nullptr; // replaced buffer, faded out after a swap
-    uint32_t         swap_frames_ = 0;
-    int              swap_n_      = 0;
+    volatile int8_t cur_q_       = -1;
+    const int16_t*  swap_old_    = nullptr; // replaced buffer, faded out after a swap
+    uint32_t        swap_frames_ = 0, swap_pos_ = 0;
+    int             swap_n_      = 0;
 
     volatile int   active_     = -1;
     volatile int   pending_    = -1;
+    volatile int   sync_       = 1;
     volatile bool  playing_    = false;
     volatile float amp_target_ = 0;
 
