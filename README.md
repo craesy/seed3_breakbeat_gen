@@ -10,20 +10,20 @@ SuperCollider plays the result. None of that can run on a microcontroller.
 This project reimplements all of it in plain C++ with no OS, no heap and no
 external tools, then checks the result against the original sample-for-sample.
 
-> Runs on a Seed3: generating, playback and CHOP mode have been used on
-> hardware. LIVE mode's quarter solo is new and so far only tested on the host.
-> The engine and player pass host tests. The USB log shows what it is doing.
+> Runs on a Seed3: generating and playback have been used on hardware. Focus
+> mode (D15/D16) is new and so far only tested on the host. The engine and
+> player pass host tests. The USB log shows what it is doing.
 
 ## Hardware
 
 | Seed pin | Connect to | Purpose |
 |---|---|---|
-| D15 | button to GND | **Generate** a new beat (hold ≥ 0.6 s: **CHOP mode**) |
-| D16 | button to GND | **Play / stop** (norns K3) |
-| D17 | button to GND | **Next break** (hold ≥ 0.6 s: **LIVE mode**) |
-| D18 | button to GND | **Previous saved beat** (hold: next) |
-| D19–D22 | 10 k pots (3V3 / AGND) | `use_pots = 1`: tempo, beats, chaos, volume. LIVE mode: pick a version of a soloed quarter (always). `kPots = false` in `src/main.cpp` stops reading them |
-| D23, D24, D25, D28 | 3V3 → LED → resistor (e.g. 330 Ω) → pin (lit when the pin is low; for LEDs to GND set `kQledLow = false`) | **Quarter LEDs:** lit while quarter 1, 2, 3, 4 of the loop plays |
+| D15 | button to GND | **Focus:** loop the 4-bar part (quarter) playing now; press again to go back to the whole loop |
+| D16 | button to GND | **New version** of the quarter in focus (only in focus) |
+| D17 | button to GND | **New beat** from the same break (not in focus) |
+| D18 | button to GND | **Next break** on the card, and a new beat from it (not in focus) |
+| D19–D22 | 10 k pots (3V3 / AGND; 4.7 k works too) | how varied D16's new versions are (see below). `kPots = false` in `src/main.cpp` stops reading them |
+| D23, D24, D25, D28 | 3V3 → LED → resistor (e.g. 330 Ω) → pin (lit when the pin is low; for LEDs to GND set `kQledLow = false`) | **Quarter LEDs:** the quarter playing, or the one in focus |
 | D1–D6 | micro-SD socket | D1 DAT3, D2 DAT2, D3 DAT1, D4 DAT0, D5 CMD, D6 CLK |
 | Audio out L/R | | stereo out, 48 kHz |
 
@@ -32,126 +32,67 @@ on CMD and DAT0–3; most micro-SD breakout boards already have them. Avoid
 boards with 5 V level shifters. The button and pot pins match the
 wiring of the `MyProjects/test` project.
 
-**Pots** (`use_pots = 1`):
-- **D19 tempo:** fully left keeps the break's tempo, otherwise 60–200 BPM.
-- **D20 beats:** 4/8/12/16/24/32/48/64.
-- **D21 chaos:** scales the effect probabilities by 0–2×.
-- **D22 volume.**
+## Controls
 
-**LED:**
+At boot the first break loads and a beat starts playing (`auto_generate`).
+The loop is split into 4 quarters. With `beats = 64` (16 bars) each quarter is
+4 bars; with the default `beats = 16` each is one bar. `beats` has to divide
+by 4 for focus mode.
+
+- **D15, focus:** the quarter playing when you press it starts looping on its
+  own, seamlessly from the next beat (pressed on its last beat: from its
+  start). Press D15 again to go back to the whole loop: it carries on from
+  the next beat, with the version you were hearing spliced into its quarter
+  (5 ms crossfades at the edges).
+- **D16, new version (focus only):** makes a new random version of the
+  quarter in focus: new chops, stutters, reverses and so on, at the same tempo
+  and length. It carries on from where the quarter starts in the break, so
+  kicks and snares stay on the same bar positions. It swaps in on the next beat
+  (2 ms crossfade). Press again for another; the last one you hear is kept when
+  you leave focus. Pressing D15 while it is still working stops it.
+- **D17, new beat:** a whole new loop from the same break, swapped in on the
+  next beat. Pressing D17 or D18 while it works abandons it and does that
+  press instead.
+- **D18, next break:** loads the next `.wav` in `/MBB/SAMPLES` (wrapping
+  round; the folder is rescanned, so new files show up) and makes a new beat
+  from it. Several presses while it is busy skip that many breaks.
+- D17 and D18 do nothing in focus (the log says to press D15 first), and D16
+  does nothing outside it.
+
+Every new beat is saved to `/MBB/OUT` (`save = 1`); D16's versions are not
+saved on their own.
+
+**Pots (D19–D22), for D16:** each pot controls a group of the effect
+probabilities in `config.txt`. **Fully left** (0) uses the `config.txt` values,
+so new versions sound like a normal beat. Turning right moves the group
+steadily away from them, up to the maximum shown at **fully right** (100). A
+value set higher than that in `config.txt` stays as it is. The pots are read
+when you press D16, and with `kPots = false` D16 uses `config.txt` as it is.
+
+| Pot | Group | Probabilities (max at fully right) |
+|---|---|---|
+| D19 | **shuffle:** how far chops jump around, extra drums | `p_deviation` 100, `p_kick` 100, `p_snare` 100 |
+| D20 | **stutter:** repeats and cut-offs | `p_stutter` 100, `p_trunc` 50 |
+| D21 | **pitch:** reverse, pitch-up, half speed | `p_reverse` 80, `p_pitch` 60, `p_half` 40 |
+| D22 | **space:** reverb and time-stretch | `p_reverb` 60, `p_stretch` 40 |
+
+D17 and D18 use `config.txt` as it is.
+
+**LED (on the Seed):**
 - **Slow blink:** booting or busy (analysing, generating, loading).
 - **Fast blink:** error. Check the USB log.
 - **Flashes on every beat** while playing, with a longer flash at the start of the loop.
-- **Solid:** a beat is loaded but stopped.
 - **Off:** nothing loaded.
-- **In CHOP mode:** on = current chop selected, off = not selected, with a
-  short blip once a second.
-- **In LIVE mode:** the beat flashes are inverted: mostly on, briefly off on every beat.
 
-**Quarter LEDs (D23, D24, D25, D28):** the loop is split into 4 quarters (one
-bar each in a 16-beat loop). The LED of the quarter being played is lit, so they
-step 1 → 2 → 3 → 4 round the loop. All are off when stopped. While a quarter
-is soloed (LIVE mode), only its LED is lit; it blinks fast while the version
-its pot asks for is still being made.
+**Quarter LEDs (D23, D24, D25, D28):** the LED of the quarter being played is
+lit, so they step 1 → 2 → 3 → 4 round the loop. In focus only that quarter's
+LED is lit; it blinks fast while D16 is making a new version.
 
-## CHOP mode: choosing what goes into the beat
-
-This is an addition; the original has no equivalent. Hold **D15** for 0.6 s to
-enter. The loop stops so you can hear each chop on its own. All four buttons
-change role, and every action is also printed to the USB log
-(e.g. `chop 3/12 SNARE 168 ms ON`).
-
-| Button | Short press | Hold ≥ 0.6 s |
-|---|---|---|
-| D15 | **generate** from the selected chops, leave CHOP mode and play | leave without generating (the old loop resumes) |
-| D16 | **play the current chop** (on press, like a pad) | change how the break is chopped: at the hits → 8 → 16 → 32 equal chops |
-| D17 | **next chop** (and play it) | previous chop |
-| D18 | **current chop on/off** | select all → kicks → kicks+snares → snares → other |
-
-- **Chops:**
-  - By default the break is chopped at its hits, as in the original; each chop
-    is labelled kick, snare or other.
-  - Equal chops are capped at one per 16th note. A 2-bar break gives at most 32.
-- **Selection:**
-  - At least one chop always stays on.
-  - The selection is kept for later beats, including normal D15 presses.
-  - Loading another break or changing the chopping resets it to all.
-- **Generating:**
-  - New beats are built only from the selected chops. The kick and snare
-    placement also uses only selected kicks and snares.
-  - With every chop selected, the output is exactly what the original makes.
-  - With a selection or equal chops, chops are placed on a 16th-note grid
-    instead of an 8th-note grid, so short chops keep their length.
-
-## LIVE mode: playing with the loop
-
-This is an addition; the original has no equivalent. Hold **D17** for 0.6 s to
-enter it (outside CHOP mode). The loop keeps playing. LIVE mode splits the loop
-into 4 quarters; with a 16-beat loop, each quarter is one bar.
-
-| Button (tap) | Pot | Quarter |
-|---|---|---|
-| D15 | D19 | 1st |
-| D16 | D20 | 2nd |
-| D17 | D21 | 3rd |
-| D18 | D22 | 4th |
-
-**Tap a button** to solo its quarter:
-- The quarter starts looping on its own at the next bar (or, for quarters
-  shorter than a bar, at the end of one).
-- Versions of every quarter are made in the background as soon as a loop
-  plays (at boot, and again after each new beat or break), one at a time:
-  new random chops, stutters, reverses and so on, same tempo and length.
-  Each carries on from where the quarter starts in the break, with kicks and
-  snares on the same bar positions as in a whole beat. One takes about a
-  second, so all are ready about half a minute after a new beat.
-- They are kept in RAM (the spare 45 s play buffer), so they are lost at
-  power-off and replaced when a new beat is made. Background work pauses
-  whenever a button needs the engine, so buttons stay responsive.
-
-**Turn that quarter's pot** to step through the versions:
-- Fully left is the quarter as it was; each step to the right is another
-  version. The bank holds up to 28 shared round-robin between the quarters:
-  at 177 bpm a 16-beat loop gets 5–6 per quarter, 32 beats about 3, 48
-  beats 1–2. If there is room for fewer than 4, the soloed quarter takes
-  them all (64 beats: about 3).
-- A soloed quarter's versions are made first.
-- A new version swaps in on the next beat, at the same place in the quarter,
-  crossfaded over 2 ms.
-- If the version isn't made yet, its LED blinks fast and it is made next.
-- The pot does nothing until you turn it, so an unconnected pot can't change
-  versions by drifting.
-
-**Tap the same button again** to go back to the whole loop, with the version
-you picked spliced in (5 ms crossfades at the quarter's edges). It swaps back at
-the next bar, from the start of the loop. Tapping another quarter's button
-does the same, then solos that quarter.
-
-Hold a button for ≥ 0.6 s:
-- **D15:** generate a whole new beat (a solo is kept first).
-- **D16:** play / stop.
-- **D17:** leave LIVE mode (a solo is kept first).
-- **D18:** while soloing: back to the whole loop as it was. Otherwise undo /
-  redo: swaps back to the loop as it was before the last kept version or new
-  beat. Hold again to swap forward. Soloing doesn't clear the undo step. A
-  kept version's slot is remade with a fresh version.
-
-**Notes:**
-- The loop's beats must divide by 4 (e.g. 16, 32, 64). With the default 16
-  beats a quarter is one bar; `beats = 64` makes 16-bar loops with 4-bar
-  quarters.
-- In LIVE mode the pots don't set tempo, beats, chaos or volume. Those keep the
-  values they had when you entered. New versions and a D15 hold use them.
-  When you leave, the volume jumps to D22's position.
-
-**USB log:**
-- Every change is printed, e.g. `versions: room for 23`,
-  `quarter 2 version 3 in 812 ms`, `solo quarter 2 (6 versions)` and
-  `solo: kept version 3`.
-- In LIVE mode the log also prints the pot positions (0–100) whenever one
-  moves, e.g. `pots D19 3 D20 51 D21 98 D22 60`.
-- **Pot not responding:** if it stays near 60 while you turn it, its wiper or
-  3V3/GND isn't connected.
+**USB log:** every action is printed, e.g. `focus on quarter 2 (16 beats)`,
+`quarter 2 version 3 (pots 50 80 10 50) in 640 ms` (pot positions 0–100) and
+`back to the loop, with the new quarter 2`.
+**Pot not responding:** if its number stays put while you turn it, its wiper
+or 3V3/GND isn't connected.
 
 ## SD card
 
@@ -192,12 +133,11 @@ Everything in `config.txt` is commented. The main keys:
 | `tempo` | 0 | output BPM, 0 = the break's tempo |
 | `input_tempo` | 0 | break BPM, 0 = detect |
 | `sample` | | break to load first |
-| `chop` | 0 | how CHOP mode starts: 0 = at the hits, 8/16/32 = equal chops |
-| `p_deviation … p_snare`, `kick_db`, `snare_db` | norns defaults | effect probabilities, as in the norns PARAMS menu |
+| `chop` | 0 | how the break is chopped: 0 = at the hits, 8/16/32 = equal chops |
+| `p_deviation … p_snare`, `kick_db`, `snare_db` | norns defaults | effect probabilities, as in the norns PARAMS menu (the pots' fully-left values for D16) |
 | `seed` | 0 | 0 = random; N = reproducible (beat k uses N+k−1) |
 | `save` | 1 | write each beat to `/MBB/OUT` |
-| `auto_generate`, `auto_play` | 1 | generate and play as soon as a break loads |
-| `use_pots` | 0 | read pots D19–D22 |
+| `auto_generate` | 1 | make a beat as soon as the first break loads |
 | `legacy_rate`, `legacy_channels` | 1 | copy the original's sox quirks (see below) |
 
 ## Build and flash
@@ -224,8 +164,8 @@ saves about 9 KB.
 
 | | used | of |
 |---|---|---|
-| FLASH | 122,112 B | 131,072 B (93.2%) |
-| SRAM (AXI/D2) | 243,896 B | 524,288 B |
+| FLASH | 118,524 B | 131,072 B (90.4%) |
+| SRAM (AXI/D2) | 243,064 B | 524,288 B |
 | SDRAM | 66,280,000 B | 67,108,864 B: 49.0 MB engine + 2 × 45 s play buffers |
 
 **USB log:** connect to the Seed's USB serial port (for example
@@ -256,7 +196,8 @@ To run without saving, set `save = 0`.
 
 **`SD error reading … (FatFs error N, SD error 0x…)`:** the card stopped
 answering part-way through a file. The firmware restarts the card and does not
-use the partly read break; press D17 to try again. The values of N are the same
+use the partly read break; press D18 to load the next break (with only one
+break on the card, the same one again). The values of N are the same
 as above. If it keeps happening, check the card on a computer (Disk Utility →
 First Aid) and the wiring.
 
@@ -269,7 +210,7 @@ First Aid) and the wiring.
 | `aubioonset` (tempo detection and slicing) | `src/engine/analysis.cpp`: aubio's default HFC onset detection and peak picking, and dnb.lua's tempo estimate |
 | the SuperCollider engine (two Phasors, ToggleFF, Lag, RLPF) and the norns lattice clock | `src/engine/player.cpp` |
 | norns params menu | `config.txt` and the pots |
-| norns `K3`, `PARAMS > generate` | buttons D16, D15 |
+| `PARAMS > generate` | button D17 |
 | files saved on the norns | `/MBB/OUT/<bpm>_<n>.wav` |
 
 The port copies these quirks of the original exactly:
@@ -293,7 +234,8 @@ Deliberate differences:
   scaled when the tempo changes, and the bar count restarts if the loop length
   changes.
 - **Internal clock only.** The clock is the Seed's own; there's no MIDI or link sync.
-- **New controls.** The pot mappings, chaos scaling and `seed` key are new.
+- **New controls.** Focus mode (D15/D16), the pots and the `seed` key are
+  new. Playback can't be stopped (norns K3).
 
 ## Verification
 
@@ -303,7 +245,8 @@ make -f Makefile.host cli                          # build-host/mbb: the generat
 tools/ab_run.sh <original>/lib 7 165 17           # needs lua 5.4, sox, aubio on PATH
 ```
 
-To try out chop selections on a computer:
+The engine can also build beats from a selection of chops (the firmware no
+longer has a mode for it). To try it on a computer:
 
 ```sh
 build-host/mbb -i amen.wav -o out.wav -v --only kick,snare   # kick and snare chops only
@@ -321,18 +264,19 @@ The host tests check:
   - selecting every chop leaves the output unchanged;
   - beats use only the selected chops and still have the right length;
   - equal chops cover the whole break.
-- LIVE mode:
+- focus mode:
   - the quarter being played (for the quarter LEDs) is right on every sample;
-  - a solo starts on the next bar and loops just its quarter; a new version
-    swaps in on the next beat at the same place; going back waits for the end
-    of the quarter and restarts the whole loop;
-  - a kept version replaces only its quarter, with smooth seams. Starting a
-    beat part-way changes its first chop;
-  - a real beat with quarters soloed, versions switched and kept or dropped
-    at random has no clicks;
-  - a generation stopped part-way (for background versions) fails cleanly,
-    and the next one still works.
-  - The random run is written to `tests/out/live_demo.wav`.
+  - focus carries on seamlessly from the next beat and loops just its
+    quarter; pressed on the quarter's last beat it starts from the top of it;
+  - a new version swaps in on the next beat at the same place;
+  - leaving carries on from the next beat of the whole loop (after the last
+    quarter: from the start), with the version spliced in place: only its
+    quarter changes, with smooth seams;
+  - versions start at the quarter's place in the beat and have the right
+    length, and a version stopped part-way (D15 pressed) fails cleanly;
+  - the pots scale their probability groups as described above;
+  - a real beat with random focus, versions (random pots), releases and new
+    beats has no clicks. The run is written to `tests/out/focus_demo.wav`.
 
 `tools/ab_run.sh` runs the original `dnb.lua` itself, with the port's PCG32 RNG
 injected, and compares its output with the port's. All cases matched
@@ -356,9 +300,10 @@ The remaining difference, around −60 dB, comes from float versus integer
 arithmetic. The harness always passes the norns defaults, because dnb.lua's
 own command-line defaults are different.
 
-A 17–65 beat loop takes 20–130 ms to generate on an Apple M-series Mac. On
-the Seed3's 480 MHz Cortex-M7 it should take roughly 0.5–5 s, plus the time to
-write it to SD. Audio keeps playing while it generates.
+A 17–65 beat loop takes 20–130 ms to generate on an Apple M-series Mac, and a
+4-beat quarter about 8 ms. On the Seed3's 480 MHz Cortex-M7 a one-bar quarter
+takes 0.4–2.6 s (the D16 log line shows the time); whole beats take longer,
+plus the time to write them to SD. Audio keeps playing while it generates.
 
 ## Limits
 
@@ -366,5 +311,5 @@ write it to SD. Audio keeps playing while it generates.
 - **Loops:** up to 40 s at the break's tempo and 45 s at the output tempo.
   `beats` is reduced to fit.
 - **Saved beats:** up to 512 in `/MBB/OUT`.
-- **Memory:** uses all but about 0.8 MB of SDRAM, and about 8.9 KB of flash is left.
+- **Memory:** uses all but about 0.8 MB of SDRAM, and about 12 KB of flash is left.
   Keep everything at `-Os`.

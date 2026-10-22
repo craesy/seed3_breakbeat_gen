@@ -5,28 +5,14 @@
 // commands it shells out to) and the player reproduces
 // lib/Engine_Makebreakbeat.sc plus the lattice logic of makebreakbeat.lua.
 //
-// Controls (same wiring as the test project), short / long (>= 0.6 s) press:
-//   D15  generate a new beat (norns K2) / enter CHOP mode
-//   D16  play / stop (norns K3)
-//   D17  next break in /MBB/SAMPLES / enter LIVE mode
-//   D18  previous / next saved beat in /MBB/OUT (norns E)
-//   D23, D24, D25, D28 LEDs: lit while quarter 1..4 of the loop plays
-//   D19..D22 pots (config use_pots = 1): tempo, beats, chaos, volume (off: kPots)
-// CHOP mode (not in the original) picks the chops beats are built from:
-//   D15  generate from the selected chops / leave without generating
-//   D16  play the current chop (on press) / long: chop at hits, 8, 16, 32
-//   D17  next / previous chop (and play it)
-//   D18  current chop on-off / select all, kicks, snares, kicks+snares, other
-// LIVE mode (not in the original) works on quarters of the loop:
-//   D15..D18 tap: solo quarter 1..4 (it loops on its own from the next bar);
-//            tap again: back to the whole loop with the version picked
-//   D19..D22 pots: while quarter 1..4 is soloed, pick a version of it (fully
-//            left = as it was; the others are made in RAM in the background
-//            from the moment a loop plays, ~5-6 per quarter for 16 beats;
-//            a pot only takes over once it is turned)
-//   D15 long: generate a whole new beat          D16 long: play / stop
-//   D17 long: leave LIVE                         D18 long: undo / redo
-//            (while soloing: back to the loop as it was)
+// Controls (all on press, see README "Controls"):
+//   D15  focus: loop the quarter of the loop that is playing (seamlessly);
+//        press again to play the whole loop again, with any new version in it
+//   D16  in focus: make a new version of that quarter (the pots set how)
+//   D17  new beat from the same break (not in focus)
+//   D18  next break in /MBB/SAMPLES and a new beat from it (not in focus)
+//   D19..D22 pots, for D16: shuffle, stutter, pitch, space (fully left = config)
+//   D23, D24, D25, D28 LEDs: quarter playing, or in focus (blinks while D16 works)
 //
 // SD card: /MBB/config.txt, /MBB/SAMPLES/*.wav, /MBB/kick.wav,
 // /MBB/snare.wav, generated beats are written to /MBB/OUT/<bpm>_<n>.wav.
@@ -318,135 +304,49 @@ enum class UiState : uint8_t
     Error
 };
 
-volatile UiState g_ui         = UiState::Boot;
-GPIO             g_qled[4];         // D23, D24, D25, D28: quarter being played
-constexpr bool   kQledLow = true;   // LEDs wired 3V3 -> LED -> resistor -> pin: low = lit
+volatile UiState g_ui = UiState::Boot;
+GPIO             g_qled[4];       // D23, D24, D25, D28: quarter being played
+constexpr bool   kQledLow = true; // LEDs wired 3V3 -> LED -> resistor -> pin: low = lit
+constexpr bool   kPots    = true; // false: pots not read (D16 uses config.txt as is)
 volatile bool    g_pots_ready = false;
-// false: pots not read at all (use_pots is ignored, LIVE has no versions)
-constexpr bool kPots = true;
-// LIVE solo, see StartSolo(); set by main(), read by the audio interrupt
-volatile int8_t  g_solo_q    = -1;    // quarter soloed
-volatile uint8_t g_solo_n    = 1;     // versions on its pot (0 = as it was)
-volatile uint8_t g_solo_req  = 0;     // version the pot asks for
-volatile bool    g_solo_wait = false; // that version is still being made (LED blinks)
-float            g_solo_hold = 0;     // pot when the solo started (pickup)
-bool             g_solo_live = false;
-// Versions of the quarters, see BankFit()
-constexpr int kSlots = 28;
-struct Bank
-{
-    bool     ok;
-    double   fpb;
-    int      beats, mem, n, epoch; // loop beats, buffer, slots, layout count
-    uint32_t base, slot;
-    int8_t   q[kSlots];     // quarter of each slot (-1: the next one soloed)
-    uint8_t  state[kSlots]; // 0: to make, 1: ready, 2: failed
-    uint32_t frames[kSlots];
-} g_bank;
+float            g_pot_s[4]   = {}; // smoothed pots, 0..1
 
-// Button events latched by the audio interrupt (generation blocks main()).
-volatile int      g_ev_generate = 0, g_ev_sample = 0, g_ev_out = 0, g_ev_chop = 0, g_ev_undo = 0;
-volatile uint8_t  g_ev_quarter  = 0; // LIVE: quarters tapped (bits)
-volatile uint32_t g_ev_out_ms   = 0;
-uint32_t          g_btn_down[4] = {};
-
-// CHOP mode: button events go through a small queue (order matters).
-enum ChopEv : uint8_t
+// Button presses, in order (the audio interrupt queues them, main() runs
+// them; generating blocks main()). Low bits: button, high bits: the quarter
+// playing at the press.
+enum Ev : uint8_t
 {
-    kAudition,
-    kNext,
-    kPrev,
-    kToggle,
-    kFilter,
-    kGrid
+    kFocus, // D15
+    kRegen, // D16
+    kNew,   // D17
+    kNext   // D18
 };
-volatile bool    g_chop_mode = false, g_chop_led = false;
-volatile uint8_t g_cq[16];
-volatile bool    g_live_mode   = false;
-float            g_pot_hold[4] = {}; // LIVE: pots frozen for generate/volume
-float            g_pot_s[4]    = {}; // smoothed pots
-volatile uint8_t g_cq_w = 0, g_cq_r = 0;
-
-void PushChop(uint8_t ev)
-{
-    if(static_cast<uint8_t>(g_cq_w - g_cq_r) < sizeof(g_cq))
-    {
-        g_cq[g_cq_w & 15] = ev;
-        g_cq_w            = g_cq_w + 1;
-    }
-}
-
-float Pot(int i)
-{
-    if(!g_pots_ready)
-        return 0.5f;
-    return g_live_mode ? g_pot_hold[i] : g_pot_s[i];
-}
+volatile uint8_t g_q[16];
+volatile uint8_t g_q_w = 0, g_q_r = 0;
+volatile int8_t  g_focus_q = -1;    // quarter in focus
+volatile bool    g_regen   = false; // a new version of it is being made
 
 void PollButtons()
 {
-    const uint32_t now = System::GetNow();
     for(int i = 0; i < 4; i++)
     {
         buttons[i].Debounce();
-        if(buttons[i].RisingEdge())
+        if(buttons[i].RisingEdge() && static_cast<uint8_t>(g_q_w - g_q_r) < sizeof(g_q))
         {
-            g_btn_down[i] = now;
-            if(i == 1 && !g_live_mode)
-            {
-                if(g_chop_mode)
-                    PushChop(kAudition);
-                else
-                    g_player.TogglePlay(); // runs in the audio interrupt already
-            }
-        }
-        if(buttons[i].FallingEdge())
-        {
-            const bool longp = now - g_btn_down[i] >= 600;
-            if(g_live_mode)
-            {
-                if(!longp)
-                    g_ev_quarter = static_cast<uint8_t>(g_ev_quarter | (1 << i));
-                else if(i == 0)
-                    g_ev_generate = g_ev_generate + 1;
-                else if(i == 1)
-                    g_player.TogglePlay();
-                else if(i == 3)
-                    g_ev_undo = g_ev_undo + 1;
-                else
-                    g_live_mode = false;
-            }
-            else if(i == 2 && longp && !g_chop_mode)
-            {
-                for(int f = 0; f < 4; f++)
-                    g_pot_hold[f] = Pot(f);
-                g_live_mode = true;
-            }
-            else if(i == 0)
-            {
-                if(longp)
-                    g_ev_chop = g_ev_chop + 1;
-                else
-                    g_ev_generate = g_ev_generate + 1;
-            }
-            else if(g_chop_mode)
-            {
-                if(i == 1 && longp)
-                    PushChop(kGrid);
-                else if(i == 2)
-                    PushChop(longp ? kPrev : kNext);
-                else if(i == 3)
-                    PushChop(longp ? kFilter : kToggle);
-            }
-            else if(i == 2)
-                g_ev_sample = g_ev_sample + 1;
-            else if(i == 3)
-            {
-                g_ev_out    = g_ev_out + (longp ? 1 : -1);
-                g_ev_out_ms = now;
-            }
+            const int q     = std::max(0, g_player.playing_quarter());
+            g_q[g_q_w & 15] = static_cast<uint8_t>(i | q << 4);
+            g_q_w           = g_q_w + 1;
         }
     }
+}
+
+// True if a press of a button in `mask` (bit = Ev) is waiting.
+bool Pending(unsigned mask)
+{
+    for(uint8_t i = g_q_r; i != g_q_w; i++)
+        if((mask >> (g_q[i & 15] & 3)) & 1)
+            return true;
+    return false;
 }
 
 void UpdateLed()
@@ -458,26 +358,17 @@ void UpdateLed()
         case UiState::Error: on = (now / 60) & 1; break;
         case UiState::Boot:
         case UiState::Busy: on = (now / 150) & 1; break;
-        default:
-            if(g_chop_mode) // lit = chop on, short blip every second
-                on = g_chop_led != ((now % 1000) < 80);
-            else if(g_player.active() < 0)
-                on = false;
-            else if(g_player.playing()) // flash on every beat, longer on the "one"; inverted in LIVE
-                on = g_live_mode
-                     != (g_player.since_tick() < (g_player.last_tick_restarted() ? 7200u : 1920u));
-            else
-                on = true; // a beat is loaded and stopped
+        default: // flash on every beat, longer on the "one"
+            on = g_player.active() >= 0
+                 && g_player.since_tick() < (g_player.last_tick_restarted() ? 7200u : 1920u);
     }
     hw.SetLed(on);
 
-    // Quarter LEDs: the quarter of the loop being played, while playing; in
-    // a solo the soloed one (blinking while its version is being made)
-    const int sq = g_solo_q;
-    const int q  = sq >= 0 ? sq : g_player.playing() ? g_player.playing_quarter() : -1;
+    const int fq = g_focus_q;
+    const int q  = fq >= 0 ? fq : g_player.playing_quarter();
     for(int i = 0; i < 4; i++)
     {
-        const bool lit = i == q && !(sq >= 0 && g_solo_wait && (now / 100) & 1);
+        const bool lit = i == q && !(fq >= 0 && g_regen && (now / 100) & 1);
         g_qled[i].Write(lit != kQledLow);
     }
 }
@@ -485,32 +376,10 @@ void UpdateLed()
 void AudioCallback(AudioHandle::InputBuffer, AudioHandle::OutputBuffer out, size_t size)
 {
     PollButtons();
-    float vol = 1;
     if(g_pots_ready)
-    {
         for(int f = 0; f < 4; f++)
-        {
             g_pot_s[f] += 0.05f * (hw.adc.GetFloat(f) - g_pot_s[f]); // ~20 ms
-            if(f != g_solo_q || !g_live_mode)
-                continue;
-            // LIVE solo: the pot picks one of n versions (with hysteresis),
-            // once it has been turned (an unconnected input just drifts)
-            const float p = g_pot_s[f], n = g_solo_n, z = g_solo_req;
-            if(!g_solo_live)
-            {
-                if(std::fabs(p - g_solo_hold) <= 0.05f)
-                    continue;
-                g_solo_live = true;
-            }
-            else if(p > z / n - 0.03f && p < (z + 1) / n + 0.03f)
-                continue;
-            g_solo_req = static_cast<uint8_t>(std::min(n - 1, p * n));
-        }
-        const float v = Pot(3);
-        if(settings.use_pots)
-            vol = v * v;
-    }
-    g_player.Process(out[0], out[1], size, vol);
+    g_player.Process(out[0], out[1], size, 1.f);
     UpdateLed();
 }
 
@@ -529,7 +398,6 @@ struct OutFile
 constexpr int kMaxOuts = 512;
 OutFile       g_outs[kMaxOuts];
 int           g_n_outs = 0;
-OutFile       g_cur_out{0, 0};
 uint32_t      g_gen_count = 0;
 
 bool HasWavExt(const char* name)
@@ -624,11 +492,8 @@ void LoadConfig()
     const int bad     = mbb::ParseConfig(g_cfg_text, len, settings, &bad_ln);
     if(bad)
         Log("config: %d unknown line(s), first at line %d", bad, bad_ln);
-    if(!kPots)
-        settings.use_pots = 0;
-    Log("config: beats %d tempo %d seed %u pots %d", settings.beats,
-                 static_cast<int>(settings.tempo), static_cast<unsigned>(settings.seed),
-                 settings.use_pots ? 1 : 0);
+    Log("config: beats %d tempo %d seed %u", settings.beats, static_cast<int>(settings.tempo),
+        static_cast<unsigned>(settings.seed));
 }
 
 void ScanSamples()
@@ -707,8 +572,15 @@ void LogHook(void*, const char* msg)
     Log("  %s", msg);
 }
 
+// A generation gives up when one of these buttons is pressed (bit = Ev).
+volatile bool g_stop    = false;
+unsigned      g_stop_on = 0;
+
 void ProgressHook(void* ctx, float f)
 {
+    g_stop = Pending(g_stop_on);
+    if(!ctx)
+        return;
     int&      last = *static_cast<int*>(ctx);
     const int pct  = static_cast<int>(f * 100);
     if(pct >= last + 25 || (pct == 100 && last != 100))
@@ -737,134 +609,8 @@ void LoadDrums()
     }
 }
 
-// ------------------------------------------------------------- CHOP mode
-uint8_t  g_use[mbb::Analyzer::kMaxSlices];
-uint32_t g_cursor = 0, g_filter = 0, g_grid = 0;
-bool     g_was_playing = false;
-
-uint32_t CountUse()
-{
-    uint32_t c = 0;
-    for(uint32_t k = 0; k < engine.analyzer().num_slices(); k++)
-        c += g_use[k];
-    return c;
-}
-
-void ResetChops()
-{
-    std::memset(g_use, 1, sizeof(g_use));
-    g_cursor = g_filter = 0;
-}
-
-void ShowChop(bool play)
-{
-    const mbb::Slice& s = engine.analyzer().slices()[g_cursor];
-    g_chop_led          = g_use[g_cursor];
-    if(play)
-    {
-        ScopedIrqBlocker blk;
-        g_player.Audition(engine.source().Frame(s.start), s.len);
-    }
-    static const char* const kCls[] = {"other", "KICK", "SNARE"};
-    Log("chop %u/%u %s %u ms %s", static_cast<unsigned>(g_cursor + 1),
-        static_cast<unsigned>(engine.analyzer().num_slices()), kCls[s.cls],
-        static_cast<unsigned>(s.len / 48), g_use[g_cursor] ? "ON" : "off");
-}
-
-void LogChops()
-{
-    Log("%u chops (%s), %u on", static_cast<unsigned>(engine.analyzer().num_slices()),
-        g_grid ? "equal" : "at hits", static_cast<unsigned>(CountUse()));
-}
-
-void ChopEvent(uint8_t ev)
-{
-    const uint32_t n = engine.analyzer().num_slices();
-    switch(ev)
-    {
-        case kNext: g_cursor = (g_cursor + 1) % n; break;
-        case kPrev: g_cursor = (g_cursor + n - 1) % n; break;
-        case kToggle:
-            if(g_use[g_cursor] && CountUse() == 1)
-                Log("keep at least one chop");
-            else
-                g_use[g_cursor] ^= 1;
-            ShowChop(false);
-            return;
-        case kFilter:
-        {
-            // all, kicks, kicks+snares, snares, other (bit = slice class)
-            static const uint8_t kMasks[] = {7, 2, 6, 4, 1};
-            static const char* const kNames[] = {"all", "kicks", "kicks+snares", "snares", "other"};
-            for(int tries = 0; tries < 5; tries++)
-            {
-                g_filter = (g_filter + 1) % 5;
-                for(uint32_t k = 0; k < n; k++)
-                    g_use[k] = (kMasks[g_filter] >> engine.analyzer().slices()[k].cls) & 1;
-                if(CountUse())
-                    break;
-            }
-            Log("select %s", kNames[g_filter]);
-            LogChops();
-            ShowChop(false);
-            return;
-        }
-        case kGrid:
-        {
-            static const uint8_t kGrids[] = {0, 8, 16, 32};
-            uint32_t             gi       = 0;
-            while(gi < 4 && kGrids[gi] != g_grid)
-                gi++;
-            g_grid = kGrids[(gi + 1) % 4];
-            {
-                ScopedIrqBlocker blk;
-                g_player.StopAudition();
-            }
-            engine.Chop(g_grid);
-            ResetChops();
-            LogChops();
-            break;
-        }
-        default: break;
-    }
-    ShowChop(true);
-}
-
-void EnterChop()
-{
-    if(!g_break_ok)
-    {
-        Log("no break loaded");
-        return;
-    }
-    {
-        ScopedIrqBlocker blk;
-        g_was_playing = g_player.playing();
-        if(g_was_playing)
-            g_player.TogglePlay();
-        g_cq_r      = g_cq_w; // drop stale events
-        g_chop_mode = true;
-    }
-    Log("CHOP mode");
-    LogChops();
-    ShowChop(true);
-}
-
-void LeaveChop(bool resume)
-{
-    ScopedIrqBlocker blk;
-    g_chop_mode = false;
-    g_player.StopAudition();
-    if(resume && g_was_playing && !g_player.playing())
-        g_player.TogglePlay();
-}
-
 bool LoadBreak(int idx)
 {
-    {
-        ScopedIrqBlocker blk;
-        g_player.StopAudition(); // it reads the source buffer
-    }
     if(g_n_samples == 0)
     {
         Log("no breaks in %s", kSamples);
@@ -897,8 +643,7 @@ bool LoadBreak(int idx)
         Log("break longer than 30 s, using the first 30 s");
     // Drums are resampled/re-labelled relative to the break, so reload them.
     LoadDrums();
-    ResetChops();
-    if(!engine.Analyse(settings.input_tempo, g_grid))
+    if(!engine.Analyse(settings.input_tempo, settings.chop))
     {
         Log("analysis failed");
         return false;
@@ -911,24 +656,7 @@ bool LoadBreak(int idx)
                  a.used_grid_fallback() ? " (grid)" : "",
                  static_cast<unsigned>(System::GetNow() - t0));
     g_break_ok = true;
-    g_bank.ok  = false; // new versions from this break
     return true;
-}
-
-// The player's buffer hand-over must not race the audio interrupt.
-int ClaimFreeBuffer()
-{
-    ScopedIrqBlocker blk;
-    const int f            = g_player.ClaimFree();
-    g_player.buf[f].frames = 0; // being overwritten: nothing to undo to
-    g_bank.ok              = false;
-    return f;
-}
-
-void Publish(int target)
-{
-    ScopedIrqBlocker blk;
-    g_player.Publish(target, settings.auto_play);
 }
 
 bool SaveBeat(const mbb::PlayBuf& b)
@@ -951,95 +679,15 @@ bool SaveBeat(const mbb::PlayBuf& b)
         WriteFailed(path, w.error());
         return false;
     }
-    g_cur_out.tempo = static_cast<uint16_t>(b.tempo);
-    g_cur_out.n     = n;
     Log("saved %s (%u ms)", path, static_cast<unsigned>(System::GetNow() - t0));
     return true;
 }
 
-// Generator settings for a whole beat or a LIVE quarter: config, chaos pot,
-// chop selection and seed.
-mbb::Params GenParams()
+// The player's buffer hand-over must not race the audio interrupt.
+int ClaimFreeBuffer()
 {
-    mbb::Params p = settings.gen;
-    if(settings.use_pots)
-    {
-        const double chaos = Pot(2) * 2; // 0..2 x the configured probabilities
-        for(double* q : {&p.p_deviation, &p.p_reverse, &p.p_stutter, &p.p_pitch, &p.p_trunc,
-                         &p.p_half, &p.p_reverb, &p.p_stretch})
-            *q = std::min(100.0, *q * chaos);
-    }
-    const uint32_t n_on = CountUse(), n_all = engine.analyzer().num_slices();
-    if(n_on < n_all)
-    {
-        p.use = g_use;
-        Log("using %u/%u chops", static_cast<unsigned>(n_on), static_cast<unsigned>(n_all));
-    }
-    if(settings.seed)
-        p.seed = static_cast<uint64_t>(settings.seed) + g_gen_count;
-    else
-        p.seed = (static_cast<uint64_t>(Random::GetValue()) << 32) ^ System::GetUs();
-    g_gen_count++;
-    return p;
-}
-
-bool Generate()
-{
-    if(!g_break_ok)
-    {
-        Log("no break loaded");
-        return false;
-    }
-    g_ui = UiState::Busy;
-
-    int    beats = settings.beats;
-    double tempo = settings.tempo;
-    if(settings.use_pots)
-    {
-        static const int kBeats[] = {4, 8, 12, 16, 24, 32, 48, 64};
-        const float      pt       = Pot(0);
-        tempo = pt < 0.02f ? 0 : std::floor(60 + (pt - 0.02f) / 0.98f * 140); // 0 = break tempo
-        beats = kBeats[std::min(7, static_cast<int>(Pot(1) * 8))];
-    }
-    if(beats < 1)
-        beats = 1;
-    mbb::Params p = GenParams();
-    // makebreakbeat.lua passes floor(clock tempo) and break_beats + 1.
-    p.beats     = beats + 1;
-    p.out_tempo = tempo > 0 ? std::floor(tempo) : 0;
-
-    const int      target = ClaimFreeBuffer();
-    mbb::PlayBuf&  b      = g_player.buf[target];
-    int16_t* const mem    = g_play_mem[target];
-    Log("generating %d beats @ %d bpm from %s (seed %lu)", beats,
-                 static_cast<int>(p.out_tempo > 0 ? p.out_tempo : engine.tempo()),
-                 g_samples[g_cur_sample], static_cast<unsigned long>(p.seed & 0xffffffffu));
-    int        last = -100;
-    mbb::Hooks h;
-    h.log                  = LogHook;
-    h.progress             = ProgressHook;
-    h.ctx                  = &last;
-    const uint32_t       t0 = System::GetNow();
-    const mbb::GenResult r  = engine.Generate(p, mem, kPlayFrames, &h);
-    if(!r.ok)
-    {
-        Log("generation failed");
-        g_ui = UiState::Idle;
-        return false;
-    }
-    b.data       = mem;
-    b.frames     = r.frames;
-    b.tempo      = static_cast<int>(std::floor(r.out_tempo));
-    b.fpb        = 48000.0 * 60.0 / r.out_tempo;
-    b.loop_beats = r.beats > 1 ? r.beats - 1 : 1;
-    Log("generated %d beats (%lu frames, %d iterations) in %lu ms", b.loop_beats,
-                 static_cast<unsigned long>(r.frames), r.iterations,
-                 static_cast<unsigned long>(System::GetNow() - t0));
-    Publish(target);
-    if(settings.save)
-        SaveBeat(b);
-    g_ui = UiState::Idle;
-    return true;
+    ScopedIrqBlocker blk;
+    return g_player.ClaimFree();
 }
 
 void WaitSwap()
@@ -1049,350 +697,259 @@ void WaitSwap()
     System::Delay(3); // and its 2 ms crossfade
 }
 
-int TakeEvent(volatile int& ev)
+// Pot f, 0..1 with a small dead zone at both ends.
+float Pot(int f)
 {
-    ScopedIrqBlocker blk;
-    const int        v = ev;
-    ev                 = 0;
-    return v;
-}
-
-// LIVE versions. As soon as a loop plays, new versions of each of its
-// quarters are made in the background, one at a time (new chops, same tempo
-// and length, carrying on from where the quarter starts). They are kept in the
-// tail of a loop buffer (`mem`), behind the longest loop either buffer holds,
-// so the undo loop and kept versions never overwrite them. Up to 7 per
-// quarter; if fewer than 4 fit (long loops), a soloed quarter takes them all.
-// A new beat, break, or a loop of another tempo or length starts over.
-
-int16_t* SlotMem(int i)
-{
-    return g_play_mem[g_bank.mem] + 2 * (g_bank.base + i * g_bank.slot);
-}
-
-// Lays the bank out for the loop playing, unless it already fits it.
-bool BankFit()
-{
-    const int a = g_player.active();
-    if(a < 0 || a > 1 || !g_break_ok)
-        return false;
-    const mbb::PlayBuf& b = g_player.buf[a];
-    if(!g_bank.ok || g_bank.fpb != b.fpb || g_bank.beats != b.loop_beats || b.frames > g_bank.base)
-    {
-        g_bank.epoch++;
-        g_bank.ok    = true;
-        g_bank.fpb   = b.fpb;
-        g_bank.beats = b.loop_beats;
-        g_bank.mem   = 1 - a;
-        g_bank.base  = std::max(g_player.buf[0].frames, g_player.buf[1].frames);
-        g_bank.slot  = static_cast<uint32_t>(std::ceil((b.loop_beats / 4 + 1) * b.fpb)) + 64;
-        int n        = std::min<int>(kSlots, (kPlayFrames - g_bank.base) / g_bank.slot);
-        if(b.loop_beats % 4)
-            n = 0;
-        for(int i = 0; i < n; i++)
-        {
-            g_bank.q[i]     = static_cast<int8_t>(n < 4 ? -1 : i % 4);
-            g_bank.state[i] = 0;
-        }
-        g_bank.n = n;
-        Log("versions: room for %d", n);
-    }
-    return g_bank.n > 0;
-}
-
-// Slot of version k (1..) of quarter q, -1 if there is none.
-int SlotOf(int q, int k)
-{
-    for(int i = 0; i < g_bank.n; i++)
-        if(g_bank.q[i] == q && --k == 0)
-            return i;
-    return -1;
-}
-
-// LIVE solo. Quarter q of the loop (buffer `full`) loops on its own (player
-// buffers 2 and 3, from the next bar) and its pot picks a version. Ending the
-// solo either swaps back to `full` or splices the version picked into the
-// other loop buffer (`pool`) and swaps to that, so undo goes back to the loop
-// as it was.
-struct Solo
-{
-    mbb::PlayBuf full;
-    int          a, pool, beats, sync, shown;
-    uint32_t     s0, s1;
-} g_s;
-
-mbb::PlayBuf SoloBuf(int k)
-{
-    mbb::PlayBuf b = g_s.full;
-    b.loop_beats   = g_s.beats;
-    b.data         = g_s.full.data + 2 * g_s.s0;
-    b.frames       = std::min(static_cast<uint32_t>((g_s.beats + 1) * b.fpb), b.frames - g_s.s0);
-    const int i    = SlotOf(g_solo_q, k);
-    if(i >= 0)
-    {
-        b.data   = SlotMem(i);
-        b.frames = g_bank.frames[i];
-    }
-    return b;
-}
-
-void StartSolo(int q)
-{
-    WaitSwap();
-    const int a = g_player.active();
-    if(!g_break_ok || a < 0 || a > 1)
-        return;
-    g_s.full = g_player.buf[a];
-    if(g_s.full.loop_beats % 4)
-    {
-        Log("solo: %d beats do not split into quarters", g_s.full.loop_beats);
-        return;
-    }
-    BankFit();
-    int n = 1;
-    for(int i = 0; i < g_bank.n; i++)
-    {
-        if(g_bank.n < 4 && g_bank.q[i] != q) // long loops: this quarter takes every slot
-        {
-            g_bank.q[i]     = static_cast<int8_t>(q);
-            g_bank.state[i] = 0;
-            g_bank.epoch++;
-        }
-        n += g_bank.q[i] == q;
-    }
     if(!g_pots_ready)
-        n = 1;
-    g_s.a     = a;
-    g_s.pool  = 1 - a;
-    g_s.beats = g_s.full.loop_beats / 4;
-    g_s.sync  = g_s.beats % 4 ? g_s.beats : 4; // swaps in and out on a bar (or a shorter quarter)
-    g_s.shown = 0;
-    mbb::Player::Quarter(g_s.full, q, g_s.s0, g_s.s1);
-    {
-        ScopedIrqBlocker blk;
-        g_player.buf[2] = SoloBuf(0);
-        g_player.Publish(2, false, g_s.sync);
-        g_solo_hold = g_pot_s[q];
-        g_solo_live = false;
-        g_solo_req  = 0;
-        g_solo_wait = false;
-        g_solo_n    = static_cast<uint8_t>(n);
-        g_solo_q    = static_cast<int8_t>(q);
-    }
-    Log("solo quarter %d (%d versions)", q + 1, n - 1);
+        return 0.f; // config.txt as it is
+    return std::min(1.f, std::max(0.f, (g_pot_s[f] - 0.02f) / 0.96f));
 }
 
-void EndSolo(bool keep)
+// Generator settings: config (with `pots`: scaled by the pots) and seed.
+mbb::Params GenParams(bool pots)
 {
-    const int k = keep ? g_s.shown : 0;
-    if(k > 0)
+    mbb::Params p = settings.gen;
+    if(pots)
     {
-        int16_t* const     dst = g_play_mem[g_s.pool];
-        const mbb::PlayBuf v   = SoloBuf(k);
-        const uint32_t     m   = std::min(v.frames, g_s.full.frames - g_s.s0);
-        std::memcpy(dst + 2 * g_s.s0, v.data, m * 4);
-        mbb::Player::Splice(g_s.full, dst, g_s.s0, g_s.s1, m);
-        ScopedIrqBlocker blk;
-        g_player.buf[g_s.pool]      = g_s.full;
-        g_player.buf[g_s.pool].data = dst;
-        g_player.Publish(g_s.pool, false, g_s.sync);
+        const float x[4] = {Pot(0), Pot(1), Pot(2), Pot(3)};
+        mbb::ApplyPots(p, x); // see config.h
     }
+    if(settings.seed)
+        p.seed = static_cast<uint64_t>(settings.seed) + g_gen_count;
     else
+        p.seed = (static_cast<uint64_t>(Random::GetValue()) << 32) ^ System::GetUs();
+    g_gen_count++;
+    return p;
+}
+
+// D17: a new loop from the break loaded, played from the next beat.
+bool Generate()
+{
+    if(!g_break_ok)
     {
-        ScopedIrqBlocker blk;
-        g_player.Publish(g_s.a, false, g_s.sync);
-    }
-    WaitSwap();
-    if(k > 0)
-        g_bank.state[SlotOf(g_solo_q, k)] = 0; // it is in the loop now: make another
-    g_solo_q    = -1;
-    g_solo_wait = false;
-    Log(k > 0 ? "solo: kept version %d" : "solo: back to the loop", k);
-}
-
-// Swaps to the version the pot asks for (on the next beat), if it is ready.
-void SoloSwitch()
-{
-    const int k  = g_solo_req, i = SlotOf(g_solo_q, k);
-    const int st = k == 0 ? 1 : i < 0 ? 2 : g_bank.state[i];
-    g_solo_wait  = st == 0;
-    if(st != 1 || k == g_s.shown)
-        return;
-    ScopedIrqBlocker blk;
-    const int  act = g_player.active();
-    const bool in  = act >= 2; // else still waiting for the bar
-    const int  b   = act == 2 ? 3 : 2;
-    g_player.buf[b] = SoloBuf(k);
-    g_player.Publish(b, false, in ? 1 : g_s.sync);
-    g_s.shown = k;
-}
-
-// LIVE quarter taps and solo controls; also run while a version is being made.
-void LivePoll()
-{
-    uint8_t taps;
-    {
-        ScopedIrqBlocker blk;
-        taps = g_ev_quarter;
-        // while soloing, another quarter's tap ends the solo and is kept to start its own
-        g_ev_quarter = g_solo_q >= 0 ? static_cast<uint8_t>(taps & ~(1 << g_solo_q)) : 0;
-    }
-    if(g_solo_q >= 0)
-    {
-        if(TakeEvent(g_ev_undo) > 0)
-            EndSolo(false);
-        else if(taps || !g_live_mode)
-            EndSolo(true);
-        else
-            SoloSwitch();
-        return;
-    }
-    for(int q = 0; q < 4 && g_live_mode; q++)
-        if((taps >> q) & 1)
-        {
-            StartSolo(q);
-            return;
-        }
-}
-
-// Next version to make: the one the soloed quarter's pot asks for, else
-// that quarter's first missing one, else the first missing one.
-int NextSlot()
-{
-    const int want = g_solo_q >= 0 ? SlotOf(g_solo_q, g_solo_req) : -1;
-    if(want >= 0 && !g_bank.state[want])
-        return want;
-    int first = -1;
-    for(int i = 0; i < g_bank.n; i++)
-        if(!g_bank.state[i] && g_bank.q[i] >= 0)
-        {
-            if(g_bank.q[i] == g_solo_q)
-                return i;
-            if(first < 0)
-                first = i;
-        }
-    return first;
-}
-
-// Button work that background versions give way to.
-bool OtherWork()
-{
-    return g_ev_generate || g_ev_sample || g_ev_out || g_ev_chop || g_cq_r != g_cq_w
-           || (g_solo_q < 0 && g_ev_undo);
-}
-
-volatile bool g_bg_stop = false;
-int           g_making = -1, g_make_epoch = 0;
-
-void BankHook(void*, float)
-{
-    LivePoll();
-    g_bg_stop = OtherWork() || g_make_epoch != g_bank.epoch
-                || g_bank.q[NextSlot()] != g_bank.q[g_making]; // a soloed quarter's come first
-}
-
-// Makes one missing version.
-void BankWork()
-{
-    if(!g_pots_ready || g_chop_mode || OtherWork() || (g_solo_q < 0 && !BankFit()))
-        return;
-    const int i = NextSlot();
-    if(i < 0)
-        return;
-    const int   q = g_bank.q[i], qb = g_bank.beats / 4;
-    mbb::Params p = GenParams();
-    p.beats       = qb + 2; // a beat over, for the splice crossfade
-    p.start_beat  = q * qb;
-    p.out_tempo   = 2880000.0 / g_bank.fpb;
-    if(std::fabs(p.out_tempo - engine.tempo()) < 1e-6)
-        p.out_tempo = 0; // the break's own tempo: no resampling
-    mbb::Hooks h;
-    h.progress   = BankHook;
-    h.stop       = &g_bg_stop;
-    g_making     = i;
-    g_make_epoch = g_bank.epoch;
-    g_bg_stop    = false;
-    const uint32_t       t0 = System::GetNow();
-    const mbb::GenResult r  = engine.Generate(p, SlotMem(i), g_bank.slot, &h);
-    if(g_bg_stop || g_make_epoch != g_bank.epoch)
-        return; // given up, or the bank changed meanwhile
-    const bool ok     = r.ok && r.frames >= (qb + 1) * g_bank.fpb;
-    g_bank.frames[i]  = r.frames;
-    g_bank.state[i]   = ok ? 1 : 2;
-    int v             = 0;
-    for(int j = 0; j <= i; j++)
-        v += g_bank.q[j] == q;
-    Log(ok ? "quarter %d version %d in %lu ms" : "quarter %d version %d failed", q + 1, v,
-        static_cast<unsigned long>(System::GetNow() - t0));
-}
-
-// LIVE: swaps back to the other buffer (the loop before the last change).
-void Undo()
-{
-    WaitSwap();
-    const int a = g_player.active();
-    if(a < 0 || a > 1 || g_player.buf[1 - a].frames == 0)
-    {
-        Log("nothing to undo");
-        return;
-    }
-    Publish(1 - a);
-    Log("undo");
-}
-
-// Loads /MBB/OUT/<tempo>_<n>.wav (16-bit stereo 48 kHz, as written above).
-bool LoadOutput(const OutFile& o)
-{
-    char path[64];
-    std::snprintf(path, sizeof(path), "%s/%u_%u.wav", kOut, static_cast<unsigned>(o.tempo),
-                  static_cast<unsigned>(o.n));
-    Log("loading %s", path);
-    SdReader     r;
-    mbb::WavInfo info;
-    if(!r.Open(path) || !mbb::ParseWav(r, info) || info.bits != 16 || info.channels != 2
-       || info.is_float || !r.Seek(info.data_offset))
-    {
-        if(ReadOk(path, r))
-            Log("%s: not a 16-bit stereo WAV", path);
-        else
-            Log("cannot open %s (FatFs error %d)", path, r.error());
+        Log("no break loaded");
         return false;
     }
-    g_ui             = UiState::Busy;
+    g_ui = UiState::Busy;
+    mbb::Params p = GenParams(false);
+    // makebreakbeat.lua passes floor(clock tempo) and break_beats + 1.
+    p.beats     = std::max(1, settings.beats) + 1;
+    p.out_tempo = settings.tempo > 0 ? std::floor(settings.tempo) : 0;
+
     const int      target = ClaimFreeBuffer();
     mbb::PlayBuf&  b      = g_player.buf[target];
     int16_t* const mem    = g_play_mem[target];
-    uint32_t       frames = info.frames < kPlayFrames ? info.frames : kPlayFrames;
-    frames                = r.Read(mem, frames * 4) / 4;
-    g_ui             = UiState::Idle;
-    if(frames == 0 || !ReadOk(path, r))
+    Log("generating %d beats @ %d bpm from %s (seed %lu)", p.beats - 1,
+        static_cast<int>(p.out_tempo > 0 ? p.out_tempo : engine.tempo()), g_samples[g_cur_sample],
+        static_cast<unsigned long>(p.seed & 0xffffffffu));
+    int        last = -100;
+    mbb::Hooks h;
+    h.log       = LogHook;
+    h.progress  = ProgressHook;
+    h.ctx       = &last;
+    h.stop      = &g_stop;
+    g_stop_on   = 1u << kNew | 1u << kNext; // pressed again: start over
+    g_stop      = false;
+    const uint32_t       t0 = System::GetNow();
+    const mbb::GenResult r  = engine.Generate(p, mem, kPlayFrames, &h);
+    g_ui                    = UiState::Idle;
+    if(g_stop)
         return false;
+    if(!r.ok)
+    {
+        Log("generation failed");
+        return false;
+    }
     b.data       = mem;
-    b.frames     = frames;
-    b.tempo      = o.tempo;
-    b.fpb        = 48000.0 * 60.0 / o.tempo;
-    const int nb = static_cast<int>(std::lround(frames / b.fpb)) - 1;
-    b.loop_beats = nb > 1 ? nb : 1;
-    Publish(target);
-    g_cur_out = o;
-    Log("playing %s (%d beats)", path, b.loop_beats);
+    b.frames     = r.frames;
+    b.tempo      = static_cast<int>(std::floor(r.out_tempo));
+    b.fpb        = 48000.0 * 60.0 / r.out_tempo;
+    b.loop_beats = r.beats > 1 ? r.beats - 1 : 1;
+    Log("generated %d beats (%lu frames, %d iterations) in %lu ms", b.loop_beats,
+        static_cast<unsigned long>(r.frames), r.iterations,
+        static_cast<unsigned long>(System::GetNow() - t0));
+    {
+        ScopedIrqBlocker blk;
+        g_player.Publish(target, true);
+    }
+    if(settings.save)
+        SaveBeat(b);
     return true;
 }
 
-void StepOutput(int steps)
+// D18: the next break (rescanned: the card may have new files), new loop.
+void NextBreak(int steps)
 {
-    ScanOutputs();
-    if(g_n_outs == 0)
+    char cur[kNameLen] = "";
+    if(g_cur_sample >= 0)
+        std::strcpy(cur, g_samples[g_cur_sample]);
+    ScanSamples();
+    g_cur_sample = 0;
+    for(int i = 0; i < g_n_samples; i++)
+        if(strcasecmp(g_samples[i], cur) == 0)
+            g_cur_sample = i;
+    g_ui = UiState::Busy;
+    if(!LoadBreak(g_cur_sample + steps))
     {
-        Log("no saved beats in %s", kOut);
+        g_ui = UiState::Error;
         return;
     }
-    int idx = g_n_outs - 1;
-    for(int i = 0; i < g_n_outs; i++)
-        if(g_outs[i].tempo == g_cur_out.tempo && g_outs[i].n == g_cur_out.n)
-            idx = i;
-    idx = ((idx + steps) % g_n_outs + g_n_outs) % g_n_outs;
-    LoadOutput(g_outs[idx]);
+    g_ui = UiState::Idle;
+    Generate();
+}
+
+// Focus (D15): quarter q of the loop in player buffer `a` loops on its own
+// (player buffers 2 and 3). New versions of it (D16) are made into two
+// slots of the other loop buffer, taking turns, so the one playing is never
+// overwritten. Leaving splices the version playing into the loop.
+struct Focus
+{
+    mbb::PlayBuf full;
+    int          a, q, Q, shown, made; // shown: slot playing, -1 = the quarter as it was
+    uint32_t     s0, s1, slot;
+} g_f;
+
+// Quarter buffer: the quarter as it was (k < 0) or version slot k.
+mbb::PlayBuf FocusBuf(int k, uint32_t frames)
+{
+    mbb::PlayBuf b = g_f.full;
+    b.loop_beats   = g_f.Q;
+    b.data         = k < 0 ? g_f.full.data + 2 * g_f.s0 : g_play_mem[1 - g_f.a] + 2 * k * g_f.slot;
+    b.frames       = frames;
+    return b;
+}
+
+void StartFocus(int q)
+{
+    WaitSwap();
+    const int a = g_player.active();
+    if(a < 0 || a > 1)
+    {
+        Log("no loop playing");
+        return;
+    }
+    const mbb::PlayBuf& full = g_player.buf[a];
+    if(full.loop_beats % 4)
+    {
+        Log("focus: %d beats do not split into quarters", full.loop_beats);
+        return;
+    }
+    g_f.full  = full;
+    g_f.a     = a;
+    g_f.q     = q;
+    g_f.Q     = full.loop_beats / 4;
+    g_f.shown = -1;
+    g_f.made  = 0;
+    mbb::Player::Quarter(full, q, g_f.s0, g_f.s1);
+    // a beat over for the loop's tail and the splice; 12.5 ms over MaxBeats' margin
+    g_f.slot = static_cast<uint32_t>(std::ceil((g_f.Q + 1) * full.fpb)) + 600;
+    const uint32_t n = std::min(static_cast<uint32_t>((g_f.Q + 1) * full.fpb), full.frames - g_f.s0);
+    {
+        ScopedIrqBlocker blk;
+        // carry on seamlessly from the next beat if it is in quarter q, else
+        // (pressed on its last beat) go back to the start of it
+        const int nb    = (g_player.lattice() + 1) % full.loop_beats;
+        g_player.buf[2] = FocusBuf(-1, n);
+        g_player.Publish(2, false, 1, nb / g_f.Q == q ? nb - q * g_f.Q : 0);
+        g_focus_q = static_cast<int8_t>(q);
+    }
+    Log("focus on quarter %d (%d beats)", q + 1, g_f.Q);
+}
+
+void EndFocus()
+{
+    WaitSwap();
+    const int a = g_f.a;
+    if(g_f.shown >= 0) // the loop buffer is not being read meanwhile
+    {
+        const mbb::PlayBuf& v = g_player.buf[g_player.active()];
+        mbb::Player::Splice(g_play_mem[a], g_f.full.frames, v.data, g_f.s0, g_f.s1, v.frames);
+    }
+    {
+        ScopedIrqBlocker blk;
+        // carry on with the next beat of the loop (after the quarter's last
+        // beat, the beat after the quarter)
+        const int Q = g_f.Q, nb = (g_player.lattice() + 1) % Q;
+        g_player.Publish(a, false, 1, nb ? g_f.q * Q + nb : (g_f.q + 1) * Q % (4 * Q));
+    }
+    WaitSwap();
+    g_focus_q = -1;
+    Log(g_f.shown >= 0 ? "back to the loop, with the new quarter %d" : "back to the loop",
+        g_f.q + 1);
+}
+
+// D16: a new version of the quarter in focus, played from the next beat.
+void Regen()
+{
+    WaitSwap(); // the slot about to be overwritten may still be playing
+    const int k = g_f.shown == 0 ? 1 : 0;
+    if(static_cast<uint64_t>(k + 1) * g_f.slot > kPlayFrames)
+    {
+        Log("quarter too long");
+        return;
+    }
+    mbb::Params p = GenParams(true);
+    p.beats       = g_f.Q + 1;
+    p.start_beat  = g_f.q * g_f.Q;
+    p.out_tempo   = 2880000.0 / g_f.full.fpb;
+    if(std::fabs(p.out_tempo - engine.tempo()) < 1e-6)
+        p.out_tempo = 0; // the break's own tempo: no resampling
+    int pv[4];
+    for(int f = 0; f < 4; f++)
+        pv[f] = static_cast<int>(Pot(f) * 100 + 0.5f);
+    mbb::Hooks h;
+    h.progress = ProgressHook;
+    h.stop     = &g_stop;
+    g_stop_on  = 1u << kFocus; // leaving focus: give up
+    g_stop     = false;
+    g_regen    = true;
+    const uint32_t       t0 = System::GetNow();
+    const mbb::GenResult r  = engine.Generate(p, g_play_mem[1 - g_f.a] + 2 * k * g_f.slot, g_f.slot, &h);
+    g_regen                 = false;
+    if(g_stop)
+        return;
+    if(!r.ok || r.frames + 2 < (g_f.Q + 1) * g_f.full.fpb)
+    {
+        Log("quarter %d: generation failed", g_f.q + 1);
+        return;
+    }
+    {
+        ScopedIrqBlocker blk;
+        const int b     = g_player.active() == 2 ? 3 : 2;
+        g_player.buf[b] = FocusBuf(k, r.frames);
+        g_player.Publish(b, false);
+    }
+    g_f.shown = k;
+    Log("quarter %d version %d (pots %d %d %d %d) in %lu ms", g_f.q + 1, ++g_f.made, pv[0], pv[1],
+        pv[2], pv[3], static_cast<unsigned long>(System::GetNow() - t0));
+}
+
+// One button press (`steps` presses of it in a row).
+void Run(int ev, int q, int steps)
+{
+    const bool focus = g_focus_q >= 0;
+    switch(ev)
+    {
+        case kFocus:
+            if(focus)
+                EndFocus();
+            else
+                StartFocus(q);
+            break;
+        case kRegen:
+            if(focus)
+                Regen();
+            else
+                Log("D16: press D15 to focus on a quarter first");
+            break;
+        default:
+            if(focus)
+                Log("D%d: press D15 to leave focus first", 15 + ev);
+            else if(ev == kNew)
+                Generate();
+            else
+                NextBreak(steps);
+    }
 }
 
 [[noreturn]] void Fatal(const char* msg)
@@ -1444,10 +1001,7 @@ int main(void)
     }
     g_ui = UiState::Boot;
     LoadConfig();
-    g_grid = settings.chop;
 
-    // Read the pots (if on) even with use_pots = 0: LIVE mode uses them for
-    // its effects (use_pots only turns tempo/beats/chaos/volume on/off).
     if(kPots)
     {
         AdcChannelConfig pots[4];
@@ -1476,104 +1030,24 @@ int main(void)
     for(int tries = 0; tries < g_n_samples && !LoadBreak(first + tries); tries++) {}
     g_ui = g_break_ok ? UiState::Idle : UiState::Error;
 
-    ScanOutputs();
     if(g_break_ok && settings.auto_generate)
         Generate();
 
-    bool     shown_live   = false;
-    int      shown_pot[4] = {};
-    uint32_t pot_ms       = 0;
     while(true)
     {
-        if(g_live_mode != shown_live)
+        if(g_q_r != g_q_w)
         {
-            shown_live = g_live_mode;
-            Log(shown_live ? "LIVE mode" : "LIVE mode off");
-            shown_pot[0] = -100; // print the pots
-        }
-        if(shown_live && g_pots_ready && System::GetNow() - pot_ms >= 250)
-        {
-            // pot positions 0..100, whenever one moves
-            int  pv[4];
-            bool moved = false;
-            for(int f = 0; f < 4; f++)
+            const uint8_t e = g_q[g_q_r & 15];
+            g_q_r           = g_q_r + 1;
+            // presses of D16..D18 made meanwhile count once (D18: steps)
+            int steps = 1;
+            while((e & 3) != kFocus && g_q_r != g_q_w && (g_q[g_q_r & 15] & 3) == (e & 3))
             {
-                pv[f] = static_cast<int>(g_pot_s[f] * 100 + 0.5f);
-                moved = moved || std::abs(pv[f] - shown_pot[f]) >= 4;
+                g_q_r = g_q_r + 1;
+                steps++;
             }
-            if(moved)
-            {
-                pot_ms = System::GetNow();
-                std::memcpy(shown_pot, pv, sizeof(pv));
-                Log("pots D19 %d D20 %d D21 %d D22 %d", pv[0], pv[1], pv[2], pv[3]);
-            }
+            Run(e & 3, e >> 4, steps);
         }
-        LivePoll();
-        if(g_solo_q < 0 && (TakeEvent(g_ev_undo) & 1))
-            Undo();
-        // chop edits first, so D15 acts on the latest selection
-        while(g_cq_r != g_cq_w)
-        {
-            const uint8_t ev = g_cq[g_cq_r & 15];
-            g_cq_r           = g_cq_r + 1;
-            if(g_chop_mode)
-                ChopEvent(ev);
-        }
-        if(TakeEvent(g_ev_chop) & 1)
-        {
-            if(g_chop_mode)
-                LeaveChop(true);
-            else
-                EnterChop();
-        }
-        if(g_solo_q >= 0 && (g_ev_generate || g_ev_sample || g_ev_out))
-            EndSolo(true); // these load a new loop
-        if(TakeEvent(g_ev_generate) > 0)
-        {
-            if(g_chop_mode)
-            {
-                LeaveChop(false);
-                if(Generate())
-                {
-                    ScopedIrqBlocker blk;
-                    if(!g_player.playing())
-                        g_player.TogglePlay();
-                }
-                else
-                    LeaveChop(true);
-            }
-            else
-                Generate();
-        }
-
-        const int ds = TakeEvent(g_ev_sample);
-        if(ds != 0)
-        {
-            // Rescan (cards may have new files) and step from the current name.
-            char cur[kNameLen] = "";
-            if(g_cur_sample >= 0)
-                std::strcpy(cur, g_samples[g_cur_sample]);
-            ScanSamples();
-            g_cur_sample = 0;
-            for(int i = 0; i < g_n_samples; i++)
-                if(strcasecmp(g_samples[i], cur) == 0)
-                    g_cur_sample = i;
-            g_ui = UiState::Busy;
-            if(LoadBreak(g_cur_sample + ds))
-            {
-                g_ui = UiState::Idle;
-                if(settings.auto_generate)
-                    Generate();
-            }
-            else
-                g_ui = UiState::Error;
-        }
-
-        // Like the norns encoder: wait until the presses stop, then load.
-        if(g_ev_out != 0 && System::GetNow() - g_ev_out_ms > 400)
-            StepOutput(TakeEvent(g_ev_out));
-
-        BankWork();
         System::Delay(1);
     }
 }

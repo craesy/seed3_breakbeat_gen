@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 
 namespace mbb
 {
@@ -50,11 +49,12 @@ int Player::ClaimFree()
     return active_ == 0 ? 1 : 0;
 }
 
-void Player::Publish(int idx, bool auto_play, int sync)
+void Player::Publish(int idx, bool auto_play, int sync, int beat)
 {
     const bool first = active_ < 0;
     pending_         = idx;
     sync_            = sync;
+    beat_            = beat;
     if(first && auto_play && !playing_)
         TogglePlay();
 }
@@ -79,11 +79,16 @@ void Player::Tick()
             // (norns has one global length); restart the count instead.
             if(n.loop_beats != o.loop_beats)
                 lattice_ = -1;
-            if(n.fpb == o.fpb) // e.g. LIVE quarters: 2 ms crossfade from the old buffer
+            if(n.fpb == o.fpb) // e.g. focus quarters: 2 ms crossfade from the old buffer
             {
                 swap_old_    = o.data;
                 swap_frames_ = o.frames;
                 swap_n_      = kFade;
+            }
+            if(beat_ >= 0) // play on from that beat (beat 0: tozero below)
+            {
+                lattice_ = beat_ - 1;
+                pos_a_ = pos_b_ = static_cast<uint32_t>(std::lround(beat_ * n.fpb)) % n.frames;
             }
         }
         else
@@ -117,29 +122,28 @@ void Player::Quarter(const PlayBuf& b, int q, uint32_t& s0, uint32_t& s1)
     s1               = static_cast<uint32_t>((q + 1) * len + 0.5);
 }
 
-void Player::Splice(const PlayBuf& old, int16_t* dst, uint32_t s0, uint32_t s1, uint32_t n)
+void Player::Splice(int16_t* loop, uint32_t frames, const int16_t* v, uint32_t s0, uint32_t s1,
+                    uint32_t n)
 {
-    constexpr uint32_t X   = 240;
-    const uint32_t     end = std::min(s0 + n, old.frames);
-    std::memcpy(dst, old.data, s0 * 4);
-    // fade from old into new at s0, from new back into old at s1
-    auto mix = [&](uint32_t at, bool to_new) {
-        for(uint32_t i = 0; i < X && at + i < end; i++)
+    constexpr uint32_t X    = 240;
+    const uint32_t     have = std::min(s0 + n, frames);
+    const bool         back = s1 + X <= have; // else the new audio is kept to its end
+    const uint32_t     end  = back ? s1 + X : have;
+    for(uint32_t i = s0; i < end; i++)
+    {
+        // fade in from the old audio at s0, back out to it at s1
+        float w = 1;
+        if(i < s0 + X)
+            w = (i - s0 + 0.5f) / X;
+        if(back && i >= s1)
+            w = std::min(w, 1 - (i - s1 + 0.5f) / X);
+        for(uint32_t k = 2 * i; k < 2 * i + 2; k++)
         {
-            const float w = (i + 0.5f) / X;
-            for(uint32_t k = 2 * (at + i); k < 2 * (at + i) + 2; k++)
-            {
-                const float o = old.data[k], nw = dst[k];
-                dst[k]        = static_cast<int16_t>(std::lround(to_new ? o + w * (nw - o) : nw + w * (o - nw)));
-            }
+            const int16_t nw = v[k - 2 * s0];
+            const float   o  = loop[k];
+            loop[k]          = w >= 1 ? nw : static_cast<int16_t>(std::lround(o + w * (nw - o)));
         }
-    };
-    mix(s0, true);
-    if(end == old.frames)
-        return;
-    mix(s1, false);
-    if(s1 + X < old.frames)
-        std::memcpy(dst + 2 * (s1 + X), old.data + 2 * (s1 + X), (old.frames - s1 - X) * 4);
+    }
 }
 
 void Player::Process(float* left, float* right, size_t n, float vol_target)
@@ -190,19 +194,6 @@ void Player::Process(float* left, float* right, size_t n, float vol_target)
                 }
                 swap_pos_++;
             }
-        }
-        if(aud_pos_ < aud_n_)
-        {
-            // short fades so a chop never clicks
-            const uint32_t left = aud_n_ - aud_pos_;
-            float          g    = vol_;
-            if(aud_pos_ < 48)
-                g *= aud_pos_ * (1.0f / 48);
-            if(left < 240)
-                g *= left * (1.0f / 240);
-            l += aud_[2 * aud_pos_] * g;
-            r += aud_[2 * aud_pos_ + 1] * g;
-            aud_pos_++;
         }
         float* o[2]  = {left, right};
         float  in[2] = {l, r};

@@ -477,6 +477,40 @@ static void TestConfig()
     uint32_t n = DefaultConfig(buf, sizeof(buf));
     Settings d;
     CHECK(ParseConfig(buf, n, d) == 0, "default config does not parse cleanly");
+    // old configs still parse
+    const char legacy[] = "use_pots = 1\nauto_play = 0\n";
+    CHECK(ParseConfig(legacy, sizeof(legacy) - 1, d) == 0, "use_pots/auto_play no longer parse");
+
+    // pots (focus mode, D16): left = config, right = max
+    Params      p0;
+    p0.p_reverse  = 90; // above D21's maximum: kept
+    const float mid[4] = {0.5f, 0.5f, 0.5f, 0.5f}, lo[4] = {0, 0, 0, 0}, hi[4] = {1, 1, 1, 1};
+    const float mix[4] = {0.25f, 0.75f, 1.2f, -1};
+    Params      pm = p0, pl = p0, ph = p0, px = p0;
+    ApplyPots(pm, mid);
+    ApplyPots(pl, lo);
+    ApplyPots(ph, hi);
+    ApplyPots(px, mix);
+    const double Params::*all[] = {&Params::p_deviation, &Params::p_kick, &Params::p_snare,
+                                   &Params::p_stutter, &Params::p_trunc, &Params::p_reverse,
+                                   &Params::p_pitch, &Params::p_half, &Params::p_reverb,
+                                   &Params::p_stretch};
+    bool left = true;
+    for(auto m : all)
+        left = left && pl.*m == p0.*m;
+    CHECK(left, "pots: fully left must keep config.txt");
+    CHECK(std::fabs(pm.p_deviation - 55) < 1e-9 && std::fabs(pm.p_trunc - 26) < 1e-9
+              && pm.p_reverse == 90 && std::fabs(pm.p_reverb - 32.5) < 1e-9,
+          "pots centre: dev %f trunc %f", pm.p_deviation, pm.p_trunc);
+    CHECK(ph.p_deviation == 100 && ph.p_kick == 100 && ph.p_snare == 100 && ph.p_stutter == 100
+              && ph.p_trunc == 50 && ph.p_reverse == 90 && ph.p_pitch == 60 && ph.p_half == 40
+              && ph.p_reverb == 60 && ph.p_stretch == 40 && ph.kick_db == p0.kick_db,
+          "pots fully right");
+    CHECK(std::fabs(px.p_deviation - 32.5) < 1e-9 && std::fabs(px.p_kick - 62.5) < 1e-9
+              && std::fabs(px.p_stutter - 80) < 1e-9 && std::fabs(px.p_trunc - 38) < 1e-9
+              && px.p_pitch == 60 && px.p_reverb == p0.p_reverb && px.p_stretch == p0.p_stretch,
+          "pots in between: dev %f kick %f stut %f trunc %f", px.p_deviation, px.p_kick,
+          px.p_stutter, px.p_trunc);
     std::printf("  ok\n");
 }
 
@@ -546,27 +580,14 @@ static void TestPlayer()
     run(fpb * 2 * beats + 2400 + 4800);
     CHECK(std::fabs(l[fpb * 2 * beats + 2400 + 4799] - 0.5f) < 2e-3f, "crossfaded to %f",
           l[fpb * 2 * beats + 2400 + 4799]);
-    // chop audition: plays once over silence, then stops
-    p.TogglePlay();
-    run(9600);
-    std::vector<float> chop(2 * 1000, 0.25f);
-    p.Audition(chop.data(), 1000);
-    run(1200);
-    CHECK(std::fabs(l[500] - 0.25f) < 1e-3f && std::fabs(l[1100]) < 1e-3f, "audition %f / %f", l[500],
-          l[1100]);
-    Player q; // no loop loaded yet (auto_generate = 0)
-    q.Init(48000.f);
-    q.Audition(chop.data(), 1000);
-    q.Process(l.data(), r.data(), 600, 1.f);
-    CHECK(std::fabs(r[500] - 0.25f) < 1e-2f, "audition without a loop %f", r[500]);
     std::printf("player: ok\n");
 }
 
-// LIVE mode. The test loop is a ramp whose L + R add up to the frame index,
-// so the output decodes back to the position being read.
-static void TestLive(Engine& e)
+// Focus mode (D15/D16, see main.cpp). The test loop is a ramp whose L + R
+// add up to the frame index, so the output decodes back to the position read.
+static void TestFocus(Engine& e)
 {
-    std::printf("[live]\n");
+    std::printf("[focus]\n");
     const uint32_t       fpb = 3600, beats = 16, frames = fpb * (beats + 1), ql = 4 * fpb;
     std::vector<int16_t> ramp(frames * 2), ramp2(5 * fpb * 2);
     for(uint32_t i = 0; i < frames; i++)
@@ -574,7 +595,7 @@ static void TestLive(Engine& e)
         ramp[2 * i]     = static_cast<int16_t>(i / 2);
         ramp[2 * i + 1] = static_cast<int16_t>((i + 1) / 2);
     }
-    for(uint32_t i = 0; i < 5 * fpb; i++) // another version of a quarter: 30000 + i
+    for(uint32_t i = 0; i < 5 * fpb; i++) // a new version of a quarter: 30000 + i
     {
         ramp2[2 * i]     = static_cast<int16_t>((30000 + i) / 2);
         ramp2[2 * i + 1] = static_cast<int16_t>((30001 + i) / 2);
@@ -602,21 +623,38 @@ static void TestLive(Engine& e)
         while(trn.empty() || trn.back() != pos)
             run(1);
     };
-    // index of the first sample playing buffer `b`
-    auto start_of = [&](int b) {
+    auto start_of = [&](int b) { // index of the first sample playing buffer b
         size_t i = 0;
         while(i < act.size() && act[i] != b)
             i++;
         return i;
     };
-    // decoded == offset + transport from sample a on (until n), after the crossfades
-    auto reads = [&](size_t a, size_t n, double offset) {
-        int bad = 0;
-        for(size_t i = a + 7200; i < std::min(n, dec.size()); i++)
-            bad += std::fabs(dec[i] - offset - trn[i]) > 3; // the readers' crossfade may be 1 frame apart
-        if(bad)
-            std::printf("  (%u: %.2f vs %.0f + %u)\n", unsigned(a + 7200), dec[a + 7200], offset, trn[a + 7200]);
-        return bad;
+    // samples in [a, n) not reading offset + transport
+    auto bad = [&](size_t a, size_t n, double offset) {
+        int k = 0;
+        for(size_t i = a; i < std::min(n, dec.size()); i++)
+            k += std::fabs(dec[i] - offset - trn[i]) > 3;
+        return k;
+    };
+    // largest jump of the decoded position around sample i (1 = seamless)
+    auto seam = [&](size_t i) {
+        double m = 0;
+        for(size_t k = i - 100; k < i + 100; k++)
+            m = std::max(m, std::fabs(dec[k + 1] - dec[k] - 1));
+        return m;
+    };
+    // firmware: focus on quarter fq (StartFocus) and back (EndFocus)
+    auto focus = [&](int fq) {
+        uint32_t s0, s1;
+        Player::Quarter(p.buf[0], fq, s0, s1);
+        const int nb = (p.lattice() + 1) % 16;
+        p.buf[2]     = {ramp.data() + 2 * s0, 5 * fpb, double(fpb), 4, 200};
+        p.Publish(2, false, 1, nb / 4 == fq ? nb - fq * 4 : 0);
+        return s0;
+    };
+    auto release = [&](int fq) {
+        const int nb = (p.lattice() + 1) % 4;
+        p.Publish(0, false, 1, nb ? fq * 4 + nb : (fq + 1) * 4 % 16);
     };
 
     // the quarter being played (for the quarter LEDs)
@@ -628,112 +666,143 @@ static void TestLive(Engine& e)
     }
     CHECK(wrong == 0, "playing_quarter wrong for %d samples", wrong);
 
-    // Solo: quarter 2 on its own, from the next bar (half way through beat 6)
-    uint32_t s0, s1;
-    Player::Quarter(p.buf[0], 1, s0, s1);
-    CHECK(s0 == ql && s1 == 2 * ql, "quarter 2 is %u..%u", s0, s1);
+    // D15 half way through beat 6: quarter 2 carries on from beat 6, then loops
     to(5 * fpb + fpb / 2);
-    p.buf[2] = {ramp.data() + 2 * s0, 5 * fpb, double(fpb), 4, 200};
-    p.Publish(2, false, 4);
-    run(10 * fpb);
+    uint32_t s0 = focus(1);
+    CHECK(s0 == ql, "quarter 2 starts at %u", s0);
+    run(9 * fpb);
     size_t i0 = start_of(2);
-    CHECK(i0 > 0 && i0 < act.size() && trn[i0 - 1] == 8 * fpb - 1 && trn[i0] == 0,
-          "solo started after %u (want %u)", i0 > 0 && i0 < act.size() ? trn[i0 - 1] : 0, 8 * fpb - 1);
-    CHECK(reads(i0, i0 + ql, s0) == 0 && reads(i0 + ql, i0 + 2 * ql, s0) == 0 && trn[i0 + ql] == 0,
-          "solo does not loop quarter 2");
+    CHECK(i0 < act.size() && trn[i0 - 1] == 6 * fpb - 1 && trn[i0] == 2 * fpb,
+          "focus: swapped at %u -> %u", i0 < act.size() ? trn[i0 - 1] : 0, i0 < act.size() ? trn[i0] : 0);
+    CHECK(seam(i0) < 1.5 && bad(100, i0, 0) == 0 && bad(i0 + 100, i0 + 2 * fpb, s0) == 0,
+          "focus: not seamless (%.1f)", seam(i0));
+    CHECK(trn[i0 + 2 * fpb] == 0 && bad(i0 + 2 * fpb + 7200, i0 + 6 * fpb, s0) == 0,
+          "focus: quarter 2 does not loop");
 
-    // another version: on the next beat, at the same place
+    // D16: a new version on the next beat, at the same place
     to(fpb + fpb / 2);
     p.buf[3] = {ramp2.data(), 5 * fpb, double(fpb), 4, 200};
     p.Publish(3, false);
     run(2 * fpb);
     i0 = start_of(3);
-    CHECK(i0 > 0 && i0 < act.size() && trn[i0 - 1] == 2 * fpb - 1 && trn[i0] == 2 * fpb,
+    CHECK(i0 < act.size() && trn[i0 - 1] == 2 * fpb - 1 && trn[i0] == 2 * fpb,
           "version switched at %u", i0 < act.size() ? trn[i0] : 0);
-    CHECK(reads(i0 + 200 - 7200, act.size(), 30000) == 0, "version 2 not playing");
+    CHECK(bad(i0 + 200, act.size(), 30000) == 0, "version 2 not playing");
 
-    // back to the whole loop: at the end of the solo, from the top
-    p.Publish(0, false, 4);
-    run(6 * fpb);
+    // D15 half way through its beat 3: spliced into the loop, which carries
+    // on from beat 7 with the new quarter, then the old audio from beat 8
+    to(2 * fpb + fpb / 2);
+    Player::Splice(ramp.data(), frames, ramp2.data(), s0, s0 + ql, 5 * fpb);
+    release(1);
+    run(3 * fpb);
     i0 = start_of(0);
-    CHECK(i0 > 0 && i0 < act.size() && trn[i0 - 1] == 4 * fpb - 1 && trn[i0] == 0,
-          "loop resumed after %u", i0 > 0 && i0 < act.size() ? trn[i0 - 1] : 0);
-    CHECK(reads(i0, act.size(), 0) == 0, "loop not playing from the top");
+    CHECK(i0 < act.size() && trn[i0 - 1] == 3 * fpb - 1 && trn[i0] == 7 * fpb,
+          "release: swapped at %u -> %u", i0 < act.size() ? trn[i0 - 1] : 0, i0 < act.size() ? trn[i0] : 0);
+    CHECK(seam(i0) < 1.5 && bad(i0 + 100, i0 + fpb, 30000.0 - s0) == 0
+              && bad(i0 + fpb + 300, i0 + 2 * fpb, 0) == 0,
+          "release: not seamless (%.1f) or wrong audio", seam(i0));
 
-    // Regenerating a quarter: a new 16-beat loop at 160 bpm, then quarters
-    // 2 and 4 made again and spliced in.
+    // D15 on the last beat of quarter 3: it starts from its top
+    to(11 * fpb + fpb / 2);
+    s0 = focus(2);
+    run(3 * fpb);
+    i0 = start_of(2);
+    CHECK(i0 < act.size() && trn[i0 - 1] == 12 * fpb - 1 && trn[i0] == 0,
+          "late focus: swapped at %u -> %u", i0 < act.size() ? trn[i0 - 1] : 0, i0 < act.size() ? trn[i0] : 0);
+    CHECK(bad(i0 + 7200, act.size(), s0) == 0, "late focus: quarter 3 not playing");
+    // ... and released on its last beat: the loop carries on from beat 12
+    to(3 * fpb + fpb / 2);
+    release(2);
+    run(2 * fpb);
+    i0 = start_of(0);
+    CHECK(i0 < act.size() && trn[i0 - 1] == 4 * fpb - 1 && trn[i0] == 12 * fpb,
+          "late release: swapped at %u -> %u", i0 < act.size() ? trn[i0 - 1] : 0, i0 < act.size() ? trn[i0] : 0);
+    CHECK(seam(i0) < 1.5 && bad(i0 + 100, act.size(), 0) == 0, "late release: not seamless");
+
+    // the last quarter, released on its last beat: the loop starts over
+    to(13 * fpb + fpb / 2);
+    s0 = focus(3);
+    run(fpb);
+    CHECK(p.active() == 2 && trn.back() >= 2 * fpb && trn.back() < 3 * fpb, "focus on quarter 4");
+    to(3 * fpb + fpb / 2);
+    release(3);
+    run(3 * fpb);
+    i0 = start_of(0);
+    CHECK(i0 < act.size() && trn[i0 - 1] == 4 * fpb - 1 && trn[i0] == 0 && p.lattice() % 16 == 2,
+          "release at the end: swapped at %u -> %u", i0 < act.size() ? trn[i0 - 1] : 0,
+          i0 < act.size() ? trn[i0] : 0);
+    CHECK(bad(i0 + 7200, act.size(), 0) == 0, "release at the end: loop not from the top");
+
+    // Versions of a real 16-beat loop at 160 bpm
     const uint32_t       cap = SecToFrames(12);
-    std::vector<int16_t> beat(cap * 2), part(cap * 2), out(cap * 2);
+    std::vector<int16_t> beat(cap * 2), part(cap * 2);
     Params               gp;
     gp.seed      = 11;
     gp.out_tempo = 160;
     GenResult g  = e.Generate(gp, beat.data(), cap);
-    CHECK(g.ok, "live: generate");
-    PlayBuf old = {beat.data(), g.frames, 48000.0 * 60.0 / g.out_tempo, g.beats - 1, 160};
-    Params  qp  = gp;
-    qp.beats    = old.loop_beats / 4 + 2;
-    qp.seed     = 12;
-    qp.start_beat = 0;
-    GenResult a = e.Generate(qp, part.data(), cap);
-    qp.start_beat = 4;
-    GenResult b = e.Generate(qp, part.data() + cap, cap / 2);
+    CHECK(g.ok, "focus: generate");
+    const PlayBuf old = {beat.data(), g.frames, 48000.0 * 60.0 / g.out_tempo, g.beats - 1, 160};
+    const int     Q   = old.loop_beats / 4;
+    // the firmware's version slot: a beat over, and MaxBeats' 10 ms margin
+    const uint32_t slot = static_cast<uint32_t>(std::ceil((Q + 1) * old.fpb)) + 600;
+    Params         qp   = gp;
+    qp.beats            = Q + 1;
+    qp.seed             = 12;
+    GenResult a         = e.Generate(qp, part.data(), slot);
+    qp.start_beat       = 4;
+    GenResult b         = e.Generate(qp, part.data() + cap, slot);
     CHECK(a.ok && b.ok && std::memcmp(part.data(), part.data() + cap, old.fpb * 4) != 0,
           "start_beat did not change the first chop");
-    // background versions can be given up part way
+    CHECK(a.frames + 2 >= (Q + 1) * old.fpb && a.frames <= slot, "version: %u frames in a slot of %u",
+          a.frames, slot);
+    // a version being made is given up when D15 is pressed
     volatile bool stop = true;
     Hooks         sh;
     sh.stop = &stop;
-    CHECK(!e.Generate(qp, part.data(), cap, &sh).ok, "stop flag ignored");
-    CHECK(e.Generate(qp, part.data(), cap).ok, "generate after a stop failed");
+    CHECK(!e.Generate(qp, part.data(), slot, &sh).ok, "stop flag ignored");
+    CHECK(e.Generate(qp, part.data(), slot).ok, "generate after a stop failed");
+
+    // leaving focus splices the version in place
     float max_step = 0;
     for(int q : {1, 3})
     {
         uint32_t s0, s1;
         Player::Quarter(old, q, s0, s1);
         CHECK(s0 == static_cast<uint32_t>(q * 4 * old.fpb + .5), "quarter %d starts at %u", q, s0);
-        qp.start_beat = q * old.loop_beats / 4.0;
+        qp.start_beat = q * Q;
         qp.seed       = 20 + q;
-        GenResult r   = e.Generate(qp, out.data() + 2 * s0, cap - s0);
-        CHECK(r.ok && s0 + r.frames >= s1 + 240, "quarter %d: %u frames", q, r.frames);
-        std::vector<int16_t> fresh(out.begin() + 2 * s0, out.begin() + 2 * (s0 + r.frames));
-        Player::Splice(old, out.data(), s0, s1, r.frames);
+        GenResult r   = e.Generate(qp, part.data(), slot);
+        CHECK(r.ok && r.frames + 2 >= (Q + 1) * old.fpb, "quarter %d: %u frames", q, r.frames);
+        std::vector<int16_t> out(beat.begin(), beat.begin() + 2 * old.frames);
+        Player::Splice(out.data(), old.frames, part.data(), s0, s1, r.frames);
         bool ok = true;
         for(uint32_t i = 0; i < old.frames; i++)
-        {
-            const bool in = i >= s0 && i < s1, from_new = (i >= s0 + 240 && i < s1) || (q == 3 && i >= s0 + 240);
-            const bool from_old = !in && (i < s0 || i >= s1 + 240) && q != 3;
             for(int c = 0; c < 2; c++)
             {
-                if(from_new)
-                    ok = ok && out[2 * i + c] == fresh[2 * (i - s0) + c];
-                if(from_old || i < s0)
+                if(i >= s0 + 240 && i < s1)
+                    ok = ok && out[2 * i + c] == part[2 * (i - s0) + c];
+                if(i < s0 || i >= s1 + 240)
                     ok = ok && out[2 * i + c] == old.data[2 * i + c];
             }
-        }
         CHECK(ok, "quarter %d: splice kept the wrong audio", q);
         for(uint32_t i = 1; i < old.frames; i++)
             for(int c = 0; c < 2; c++)
-            {
-                const float d = std::abs(out[2 * i + c] - out[2 * i - 2 + c]);
-                const bool  x = (i >= s0 && i < s0 + 241) || (i >= s1 && i < s1 + 241);
-                if(x)
-                    max_step = std::max(max_step, d);
-            }
+                if((i >= s0 && i < s0 + 241) || (i >= s1 && i < s1 + 241))
+                    max_step = std::max(max_step, static_cast<float>(std::abs(out[2 * i + c] - out[2 * i - 2 + c])));
     }
     float own = 0;
-    for(const std::vector<int16_t>* v : {&beat, &out})
-        for(uint32_t i = 1; i < old.frames; i++)
-            own = std::max(own, static_cast<float>(std::abs((*v)[2 * i] - (*v)[2 * i - 2])));
+    for(uint32_t i = 1; i < old.frames; i++)
+        own = std::max(own, static_cast<float>(std::abs(beat[2 * i] - beat[2 * i - 2])));
     std::printf("  splice: largest step at a seam %.0f (audio %.0f)\n", max_step, own);
     CHECK(max_step <= own, "splice seam step %.0f > %.0f", max_step, own);
 
-    // A real beat with quarters soloed, switched between versions and kept
-    // or dropped at random, as the firmware does: no clicks, NaNs or
-    // overloads. Clicks are measured as the largest step between samples.
-    const uint32_t       big = SecToFrames(20);
+    // The firmware's flow at random (D15 focus / release, D16 versions with
+    // random pots, D17 new loops): no clicks, NaNs or overloads. Clicks are
+    // measured as the largest step between samples.
+    const uint32_t       big    = SecToFrames(20);
     std::vector<int16_t> mem[2] = {std::vector<int16_t>(big * 2), std::vector<int16_t>(big * 2)};
     std::copy(beat.begin(), beat.begin() + 2 * old.frames, mem[0].begin());
-    const uint32_t       total = static_cast<uint32_t>(old.fpb * 128);
+    const uint32_t       total = static_cast<uint32_t>(old.fpb * 160);
     std::vector<int16_t> demo(total * 2);
     Player               q;
     q.Init(48000.f);
@@ -745,83 +814,87 @@ static void TestLive(Engine& e)
         rng = rng * 1664525u + 1013904223u;
         return (rng >> 8) % n;
     };
-    const int      Q = old.loop_beats / 4;
-    const uint32_t slot_len = static_cast<uint32_t>((Q + 2) * old.fpb) + 64;
-    int            solo = -1, full = 0, pool = 1, n_slots = 0, shown = 0, solos = 0, switches = 0, kept = 0;
-    uint32_t       ss0 = 0, ss1 = 0, base = 0, slot_frames[8] = {};
-    auto           slot = [&](int k) {
-        PlayBuf b    = q.buf[full];
+    struct
+    {
+        PlayBuf  full;
+        int      a = 0, q = -1, shown = -1;
+        uint32_t s0 = 0, s1 = 0;
+    } f;
+    auto focus_buf = [&](int k, uint32_t n) {
+        PlayBuf b    = f.full;
         b.loop_beats = Q;
-        if(k == 0)
-        {
-            b.data   = mem[full].data() + 2 * ss0;
-            b.frames = std::min(static_cast<uint32_t>((Q + 1) * b.fpb), b.frames - ss0);
-        }
-        else
-        {
-            b.data   = mem[pool].data() + 2 * (base + (k - 1) * slot_len);
-            b.frames = slot_frames[k];
-        }
+        b.data       = k < 0 ? f.full.data + 2 * f.s0 : mem[1 - f.a].data() + 2 * k * slot;
+        b.frames     = n;
         return b;
     };
+    float content = own; // largest step in any audio made
+    auto  steps   = [&](const int16_t* d, uint32_t n) {
+        for(uint32_t i = 2; i < 2 * n; i++)
+            content = std::max(content, static_cast<float>(std::abs(d[i] - d[i - 2])));
+    };
+    int      focuses = 0, versions = 0, kept = 0, loops = 0, seed = 100;
     float    step[2] = {0, 0}, prev[2] = {0, 0}, peak = 0;
     bool     finite  = true;
-    uint32_t next    = static_cast<uint32_t>(old.fpb * 32); // two plain loops first
+    uint32_t next = static_cast<uint32_t>(old.fpb * 32), swapped = 0; // two plain loops first
+    int      last_act = 0;
     for(uint32_t i = 0; i < total; i++)
     {
-        if(i == next)
+        if(q.active() != last_act)
+            last_act = q.active(), swapped = i;
+        if(i >= next && q.pending() < 0 && i - swapped > 150) // WaitSwap()
         {
-            const int act_b = q.active();
-            if(solo < 0 && q.pending() < 0 && act_b < 2)
+            const int what = rnd(10);
+            if(f.q < 0 && what < 8) // StartFocus
             {
-                solo = rnd(4), full = act_b, pool = 1 - act_b;
-                Player::Quarter(q.buf[full], solo, ss0, ss1);
-                base    = q.buf[full].frames;
-                n_slots = 1 + std::min<int>(7, (big - base) / slot_len);
-                for(int k = 1; k < n_slots; k++)
-                {
-                    qp.start_beat  = solo * Q;
-                    qp.seed        = 100 + solos * 8 + k;
-                    GenResult r    = e.Generate(qp, mem[pool].data() + 2 * (base + (k - 1) * slot_len), slot_len);
-                    slot_frames[k] = r.frames;
-                    CHECK(r.ok && r.frames >= (Q + 1) * old.fpb, "version %d: %u frames", k, r.frames);
-                }
-                q.buf[2] = slot(0);
-                q.Publish(2, false, 4);
-                shown = 0;
-                solos++;
+                f.a = q.active(), f.full = q.buf[f.a], f.q = q.playing_quarter(), f.shown = -1;
+                Player::Quarter(f.full, f.q, f.s0, f.s1);
+                const int nb = (q.lattice() + 1) % f.full.loop_beats;
+                q.buf[2]     = focus_buf(-1, std::min<uint32_t>((Q + 1) * f.full.fpb, f.full.frames - f.s0));
+                q.Publish(2, false, 1, nb / Q == f.q ? nb - f.q * Q : 0);
+                focuses++;
             }
-            else if(solo >= 0)
+            else if(f.q < 0) // D17: a new loop
             {
-                const int what = rnd(5);
-                if(what < 3)
+                const int t = q.ClaimFree();
+                gp.seed     = seed++;
+                GenResult r = e.Generate(gp, mem[t].data(), big);
+                CHECK(r.ok, "new loop");
+                steps(mem[t].data(), r.frames);
+                q.buf[t] = {mem[t].data(), r.frames, old.fpb, r.beats - 1, 160};
+                q.Publish(t, true);
+                loops++;
+            }
+            else if(what < 6) // Regen with random pots
+            {
+                const int   k       = f.shown == 0 ? 1 : 0;
+                const float pots[4] = {rnd(101) / 100.f, rnd(101) / 100.f, rnd(101) / 100.f, rnd(101) / 100.f};
+                Params      vp      = gp;
+                ApplyPots(vp, pots);
+                vp.beats      = Q + 1;
+                vp.start_beat = f.q * Q;
+                vp.seed       = seed++;
+                GenResult r   = e.Generate(vp, mem[1 - f.a].data() + 2 * k * slot, slot);
+                CHECK(r.ok && r.frames + 2 >= (Q + 1) * old.fpb, "version: %u frames", r.frames);
+                steps(mem[1 - f.a].data() + 2 * k * slot, r.frames);
+                const int b = q.active() == 2 ? 3 : 2;
+                q.buf[b]    = focus_buf(k, r.frames);
+                q.Publish(b, false);
+                f.shown = k;
+                versions++;
+            }
+            else // EndFocus
+            {
+                if(f.shown >= 0)
                 {
-                    shown        = rnd(n_slots);
-                    const bool in = act_b >= 2;
-                    const int  ab = in && act_b == 2 ? 3 : 2;
-                    q.buf[ab]     = slot(shown);
-                    q.Publish(ab, false, in ? 1 : 4);
-                    switches++;
-                }
-                else if(what == 3 && shown > 0)
-                {
-                    int16_t* dst = mem[pool].data();
-                    const uint32_t m = std::min(slot_frames[shown], q.buf[full].frames - ss0);
-                    std::memcpy(dst + 2 * ss0, slot(shown).data, m * 4);
-                    Player::Splice(q.buf[full], dst, ss0, ss1, m);
-                    q.buf[pool]      = q.buf[full];
-                    q.buf[pool].data = dst;
-                    q.Publish(pool, false, 4);
-                    solo = -1;
+                    const PlayBuf& v = q.buf[q.active()];
+                    Player::Splice(mem[f.a].data(), f.full.frames, v.data, f.s0, f.s1, v.frames);
                     kept++;
                 }
-                else
-                {
-                    q.Publish(full, false, 4);
-                    solo = -1;
-                }
+                const int nb = (q.lattice() + 1) % Q;
+                q.Publish(f.a, false, 1, nb ? f.q * Q + nb : (f.q + 1) * Q % (4 * Q));
+                f.q = -1;
             }
-            next += static_cast<uint32_t>(old.fpb * (0.3 + rnd(100) * 0.02));
+            next = i + static_cast<uint32_t>(old.fpb * (0.3 + rnd(100) * 0.04));
         }
         float l, r;
         q.Process(&l, &r, 1, 1.f);
@@ -836,15 +909,16 @@ static void TestLive(Engine& e)
             demo[2 * i + ch] = static_cast<int16_t>(std::lround(std::max(-1.f, std::min(1.f, o[ch])) * 32767));
         }
     }
-    const float limit = std::max(step[0], own / 32768) + 0.03f;
-    std::printf("  random: %d solos, %d version changes, %d kept: largest step %.3f (plain loop %.3f), peak %.3f\n",
-                solos, switches, kept, step[1], step[0], peak);
-    CHECK(finite && peak < 1.2f && step[1] <= limit && solos >= 4 && switches >= 8 && kept >= 2,
+    const float limit = std::max(step[0], content / 32768) + 0.03f;
+    std::printf("  random: %d focuses, %d versions, %d kept, %d new loops: largest step %.3f (plain loop "
+                "%.3f), peak %.3f\n",
+                focuses, versions, kept, loops, step[1], step[0], peak);
+    CHECK(finite && peak < 1.2f && step[1] <= limit && focuses >= 4 && versions >= 8 && kept >= 2 && loops >= 1,
           "random: step %.3f > %.3f or peak %.3f", step[1], limit, peak);
-    std::string path = g_out + "/live_demo.wav";
+    std::string path = g_out + "/focus_demo.wav";
     FileWriter  w(path.c_str());
     WriteWav16(w, demo.data(), total);
-    std::printf("live: ok\n");
+    std::printf("focus: ok\n");
 }
 
 int main(int argc, char** argv)
@@ -883,7 +957,7 @@ int main(int argc, char** argv)
         std::printf("[sox A/B skipped: set MBB_SOX]\n");
     TestGenerate(e);
     TestChop(e);
-    TestLive(e);
+    TestFocus(e);
 
     std::printf(g_fail ? "\n%d FAILURE(S)\n" : "\nALL TESTS PASSED\n", g_fail);
     return g_fail ? 1 : 0;

@@ -7,7 +7,10 @@ input_tempo = 0     # break BPM (0 = detect automatically)
 sample =            # break to load first, e.g. amen_resampled.wav
 chop = 0            # 0 = chop at each hit; 8/16/32 = equal chops
 
-# probabilities in percent (makebreakbeat defaults)
+# probabilities in percent (makebreakbeat defaults). In focus mode the
+# pots vary them for D16 (fully left = these, right = more):
+# D19 deviation/kick/snare, D20 stutter/trunc, D21 reverse/pitch/half,
+# D22 reverb/stretch
 p_deviation = 10
 p_reverse = 10
 p_stutter = 20
@@ -24,8 +27,6 @@ snare_db = -6
 seed = 0            # 0 = new random beat every time; N = beat k uses seed N+k-1
 save = 1            # write every beat to /MBB/OUT
 auto_generate = 1   # generate as soon as a break is loaded
-auto_play = 1       # start playing after the first beat
-use_pots = 0        # 1 = pots on D19-D22 set tempo/beats/chaos/volume
 
 # 1 = reproduce the original's sox quirks: non-48 kHz
 # breaks are re-labelled (pitch/speed shift) and kick/snare take the

@@ -44,29 +44,23 @@ class Player
     // Queues `idx` to replace the playing buffer on the next beat (with
     // sync > 1: the next beat that is a multiple of `sync` beats from the
     // last loop-length change). The very first buffer starts immediately (and
-    // starts playback if auto_play).
-    void Publish(int idx, bool auto_play, int sync = 1);
-    // One-shot preview of a chop (interleaved stereo float, e.g. part of
-    // Engine::source()), mixed over the loop. Not part of the original.
-    void Audition(const float* frames, uint32_t n)
-    {
-        aud_     = frames;
-        aud_n_   = n;
-        aud_pos_ = 0;
-    }
-    void StopAudition() { aud_n_ = 0; }
+    // starts playback if auto_play). Normally both readers keep their place;
+    // with beat >= 0 the new buffer plays from that beat (0 = from the top).
+    void Publish(int idx, bool auto_play, int sync = 1, int beat = -1);
 
-    // ---- LIVE mode (not part of the original), see README "LIVE mode".
+    // ---- Focus mode (not part of the original), see README "Controls".
     // Quarter (0..3) of the loop being played, -1 before the first beat.
     int playing_quarter() const { return cur_q_; }
     // Frames [s0, s1) of quarter q (0..3) of a loop.
     static void Quarter(const PlayBuf& b, int q, uint32_t& s0, uint32_t& s1);
-    // Turns dst into a copy of `old` whose frames [s0, s1) are n frames of
-    // new audio already at dst + s0, crossfaded (5 ms) at both ends. The new
-    // audio must run at least 5 ms past s1; it is kept if it reaches the end.
-    static void Splice(const PlayBuf& old, int16_t* dst, uint32_t s0, uint32_t s1, uint32_t n);
+    // Replaces frames [s0, s1) of `loop` (`frames` long) in place with the
+    // first frames of `v` (n frames, v[0] is frame s0), crossfaded (5 ms) in
+    // at s0 and back out over the 5 ms after s1. If `v` ends before that
+    // (a loop without a tail), it is kept up to its end.
+    static void Splice(int16_t* loop, uint32_t frames, const int16_t* v, uint32_t s0, uint32_t s1,
+                       uint32_t n);
 
-    // 0, 1: loops (ClaimFree); 2, 3: free for the caller (LIVE: one quarter)
+    // 0, 1: loops (ClaimFree); 2, 3: free for the caller (focus: one quarter)
     PlayBuf buf[4];
 
     int  active() const { return active_; }
@@ -91,6 +85,7 @@ class Player
     volatile int   active_     = -1;
     volatile int   pending_    = -1;
     volatile int   sync_       = 1;
+    volatile int   beat_       = -1;
     volatile bool  playing_    = false;
     volatile float amp_target_ = 0;
 
@@ -101,9 +96,6 @@ class Player
     float    xf_         = 1, amp_ = 0, vol_ = 1;
     float    lag_xf_     = 0, lag_amp_ = 0, vol_coef_ = 0;
     float    a0_ = 0, b1_ = 0, b2_ = 0, y1_[2] = {}, y2_[2] = {};
-    const float* volatile aud_ = nullptr;
-    volatile uint32_t     aud_n_ = 0;
-    uint32_t              aud_pos_ = 0;
     uint32_t since_tick_ = 0xffffffffu;
     bool     restarted_  = false;
 };

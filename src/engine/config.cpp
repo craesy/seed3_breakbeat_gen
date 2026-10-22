@@ -199,6 +199,31 @@ int ParseConfig(const char* text, uint32_t len, Settings& s, int* bad_line)
     return bad;
 }
 
+void ApplyPots(Params& p, const float pots[4])
+{
+    struct PotMap
+    {
+        double Params::*p;
+        double          max;
+    };
+    static const PotMap kMap[4][3] = {
+        {{&Params::p_deviation, 100}, {&Params::p_kick, 100}, {&Params::p_snare, 100}},
+        {{&Params::p_stutter, 100}, {&Params::p_trunc, 50}, {nullptr, 0}},
+        {{&Params::p_reverse, 80}, {&Params::p_pitch, 60}, {&Params::p_half, 40}},
+        {{&Params::p_reverb, 60}, {&Params::p_stretch, 40}, {nullptr, 0}},
+    };
+    for(int f = 0; f < 4; f++)
+    {
+        const double x = pots[f] < 0 ? 0 : (pots[f] > 1 ? 1 : pots[f]);
+        for(const PotMap& m : kMap[f])
+            if(m.p)
+            {
+                const double c = p.*m.p, hi = m.max > c ? m.max : c;
+                p.*m.p         = c + (hi - c) * x;
+            }
+    }
+}
+
 uint32_t DefaultConfig(char* buf, uint32_t cap)
 {
     static const char kText[]
@@ -211,7 +236,10 @@ uint32_t DefaultConfig(char* buf, uint32_t cap)
           "sample =            # break to load first, e.g. amen_resampled.wav\n"
           "chop = 0            # 0 = chop at each hit; 8/16/32 = equal chops\n"
           "\n"
-          "# probabilities in percent (makebreakbeat defaults)\n"
+          "# probabilities in percent (makebreakbeat defaults). In focus mode the\n"
+          "# pots vary them for D16 (fully left = these, right = more):\n"
+          "# D19 deviation/kick/snare, D20 stutter/trunc, D21 reverse/pitch/half,\n"
+          "# D22 reverb/stretch\n"
           "p_deviation = 10\n"
           "p_reverse = 10\n"
           "p_stutter = 20\n"
@@ -228,8 +256,7 @@ uint32_t DefaultConfig(char* buf, uint32_t cap)
           "seed = 0            # 0 = new random beat every time; N = beat k uses seed N+k-1\n"
           "save = 1            # write every beat to /MBB/OUT\n"
           "auto_generate = 1   # generate as soon as a break is loaded\n"
-          "auto_play = 1       # start playing after the first beat\n"
-          "use_pots = 0        # 1 = pots on D19-D22 set tempo/beats/chaos/volume\n"
+
           "\n"
           "# 1 = reproduce the original's sox quirks: non-48 kHz\n"
           "# breaks are re-labelled (pitch/speed shift) and kick/snare take the\n"
