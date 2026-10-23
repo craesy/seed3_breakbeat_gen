@@ -15,6 +15,9 @@ C_INCLUDES  += -Isrc/engine
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
 include $(SYSTEM_FILES_DIR)/Makefile
 
+# Generating spends its time in the DSP kernels: -O2 there costs ~2.4 KB of flash.
+$(BUILD_DIR)/dsp.o: OPT = -O2 -flto
+
 libdaisy:
 	$(MAKE) -C $(LIBDAISY_DIR) OPT=-Os
 

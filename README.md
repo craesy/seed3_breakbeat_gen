@@ -156,7 +156,9 @@ To flash: hold **BOOT**, tap **RESET**, release BOOT, then run `make program-dfu
 
 The firmware has to fit the Seed's 128 KB internal flash, so both libDaisy and
 the project are built with `-Os`, and the project also with link-time
-optimisation (`-flto`). A libDaisy built at the default `-O3` won't fit. The
+optimisation (`-flto`). Only `src/engine/dsp.cpp`, where generating spends its
+time, is built with `-O2` (about 2.4 KB more). A libDaisy built at the default
+`-O3` won't fit. The
 `lto-wrapper: warning: Options to Xassembler do not match` message is harmless:
 it only affects assembler listing files. `src/main.cpp` also stubs out
 libDaisy's USB host and UART drivers, which this firmware doesn't use; that
@@ -164,7 +166,7 @@ saves about 9 KB.
 
 | | used | of |
 |---|---|---|
-| FLASH | 118,524 B | 131,072 B (90.4%) |
+| FLASH | 121,324 B | 131,072 B (92.6%) |
 | SRAM (AXI/D2) | 243,064 B | 524,288 B |
 | SDRAM | 66,280,000 B | 67,108,864 B: 49.0 MB engine + 2 × 45 s play buffers |
 
@@ -300,10 +302,13 @@ The remaining difference, around −60 dB, comes from float versus integer
 arithmetic. The harness always passes the norns defaults, because dnb.lua's
 own command-line defaults are different.
 
-A 17–65 beat loop takes 20–130 ms to generate on an Apple M-series Mac, and a
-4-beat quarter about 8 ms. On the Seed3's 480 MHz Cortex-M7 a one-bar quarter
-takes 0.4–2.6 s (the D16 log line shows the time); whole beats take longer,
-plus the time to write them to SD. Audio keeps playing while it generates.
+A 17–65 beat loop takes 10–260 ms to generate on an Apple M-series Mac, and a
+4-beat quarter about 6 ms. On the Seed3's 480 MHz Cortex-M7 the hot DSP loops
+use single-precision maths (the M7's double precision and libm's `sin` are
+slow) and skip hopeless candidates in the splice and tempo searches early.
+Before that a one-bar quarter took 0.4–2.6 s on hardware; the D16 log line
+shows the time now. Whole beats take longer, plus the time to write them to
+SD. Audio keeps playing while it generates.
 
 ## Limits
 
@@ -311,5 +316,5 @@ plus the time to write them to SD. Audio keeps playing while it generates.
 - **Loops:** up to 40 s at the break's tempo and 45 s at the output tempo.
   `beats` is reduced to fit.
 - **Saved beats:** up to 512 in `/MBB/OUT`.
-- **Memory:** uses all but about 0.8 MB of SDRAM, and about 12 KB of flash is left.
-  Keep everything at `-Os`.
+- **Memory:** uses all but about 0.8 MB of SDRAM, and about 9.5 KB of flash is left.
+  Keep everything else at `-Os`.

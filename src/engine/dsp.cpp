@@ -15,6 +15,89 @@ inline float ClipF(float x)
     return x > 1.0f ? 1.0f : (x < -1.0f ? -1.0f : x);
 }
 
+// Single-precision sin for |x| < ~100: libm's double sin costs hundreds of
+// cycles on the Cortex-M7. Error < 2e-7.
+inline float SinF(float x)
+{
+    const float k = static_cast<float>(static_cast<int>(x * 0.15915494f + (x >= 0 ? 0.5f : -0.5f)));
+    x = (x - k * 6.28125f) - k * 1.9353072e-3f; // 2*pi split for exact reduction
+    if(x > 1.5707964f)
+        x = 3.1415927f - x;
+    else if(x < -1.5707964f)
+        x = -3.1415927f - x;
+    const float x2 = x * x;
+    return x
+           * (1.0f
+              + x2
+                    * (-1.6666667e-1f
+                       + x2
+                             * (8.3333333e-3f
+                                + x2 * (-1.9841270e-4f + x2 * (2.7557319e-6f + x2 * -2.5052108e-8f)))));
+}
+
+// Sum of squared differences over n floats. Stops once it exceeds `bound`
+// (sums only grow, so the full sum would exceed it too).
+inline float SqDiff(const float* a, const float* b, uint32_t n, float bound)
+{
+    float    sum = 0.0f;
+    uint32_t j   = 0;
+    for(; j + 16 <= n; j += 16)
+    {
+        for(uint32_t k = j; k < j + 16; k++)
+        {
+            const float d = a[k] - b[k];
+            sum += d * d;
+        }
+        if(sum > bound)
+            return sum;
+    }
+    for(; j < n; j++)
+    {
+        const float d = a[j] - b[j];
+        sum += d * d;
+    }
+    return sum;
+}
+
+// The first frame offset i in [0, count) minimising SqDiff(base + i frames,
+// ref, n). A coarse pass (every 8th frame) picks a likely winner first so the
+// exact pass can abandon most candidates early; the result is unchanged.
+uint32_t BestMatch(const float* base, const float* ref, uint32_t n, uint32_t count)
+{
+    uint32_t guess = 0;
+    float    coarse = 3.4e38f;
+    for(uint32_t i = 0; i < count; i++)
+    {
+        const float* a = base + i * kChannels;
+        float        s = 0.0f;
+        for(uint32_t j = 0; j + 1 < n; j += 16)
+        {
+            const float d0 = a[j] - ref[j], d1 = a[j + 1] - ref[j + 1];
+            s += d0 * d0 + d1 * d1;
+        }
+        if(s < coarse)
+        {
+            coarse = s;
+            guess  = i;
+        }
+    }
+    uint32_t best     = guess;
+    float    best_err = SqDiff(base + guess * kChannels, ref, n, 3.4e38f);
+    for(uint32_t i = 0; i < count; i++)
+    {
+        if(i == guess)
+            continue;
+        const float e = SqDiff(base + i * kChannels, ref, n, best_err);
+        if(e < best_err || (e == best_err && i < best))
+        {
+            best_err = e;
+            best     = i;
+        }
+    }
+    return best;
+}
+
+
 // ---------------------------------------------------------------- biquad
 struct Biquad
 {
@@ -108,18 +191,9 @@ void BuildKernel()
     g_kernel_ready = true;
 }
 
-inline float Kernel(double u) // u = |t| in zero crossings, < kZeros
-{
-    double pos = u * kOver;
-    int    i   = static_cast<int>(pos);
-    if(i >= kTabSize - 1)
-        return 0.0f;
-    float f = static_cast<float>(pos - i);
-    return g_kernel[i] + (g_kernel[i + 1] - g_kernel[i]) * f;
-}
-
-// Computes one stereo output frame at input position `center`.
-inline void ResamplePoint(const Buf& in, double center, double cutoff, float& l, float& r)
+// Computes one stereo output frame at input position `center`. Taps step
+// through the kernel table in single precision (`ck` = cutoff * kOver).
+inline void ResamplePoint(const Buf& in, double center, double cutoff, float ck, float& l, float& r)
 {
     const double half = kZeros / cutoff;
     int64_t      i0   = static_cast<int64_t>(std::ceil(center - half));
@@ -129,15 +203,22 @@ inline void ResamplePoint(const Buf& in, double center, double cutoff, float& l,
     if(i1 > static_cast<int64_t>(in.n) - 1)
         i1 = static_cast<int64_t>(in.n) - 1;
     float sl = 0.0f, sr = 0.0f;
-    for(int64_t i = i0; i <= i1; i++)
+    if(i1 >= i0)
     {
-        double u = std::fabs(center - static_cast<double>(i)) * cutoff;
-        if(u >= kZeros)
-            continue;
-        float        k = Kernel(u);
-        const float* f = in.d + i * kChannels;
-        sl += f[0] * k;
-        sr += f[1] * k;
+        const float  p0  = static_cast<float>((center - static_cast<double>(i0)) * cutoff * kOver);
+        const float  lim = static_cast<float>(kZeros * kOver);
+        const float* f   = in.d + i0 * kChannels;
+        const int    n   = static_cast<int>(i1 - i0) + 1;
+        for(int t = 0; t < n; t++, f += kChannels)
+        {
+            const float pos = std::fabs(p0 - static_cast<float>(t) * ck);
+            if(pos >= lim)
+                continue;
+            const int   k = static_cast<int>(pos);
+            const float w = g_kernel[k] + (g_kernel[k + 1] - g_kernel[k]) * (pos - static_cast<float>(k));
+            sl += f[0] * w;
+            sr += f[1] * w;
+        }
     }
     l = sl * static_cast<float>(cutoff);
     r = sr * static_cast<float>(cutoff);
@@ -295,11 +376,11 @@ double FilteredMeanNorm(const float* frames, uint32_t n, bool band)
 
 void Contrast(Buf& b)
 {
-    const double amount = 75.0 / 750.0;
+    const float amount = 75.0f / 750.0f;
     for(uint32_t i = 0; i < b.n * kChannels; i++)
     {
-        double d = b.d[i] * (kPi / 2.0);
-        b.d[i]   = static_cast<float>(std::sin(d + amount * std::sin(d * 4.0)));
+        const float d = b.d[i] * 1.5707964f;
+        b.d[i]        = SinF(d + amount * SinF(d * 4.0f));
     }
 }
 
@@ -366,29 +447,18 @@ bool SpliceInto(Buf& a, const Buf& b, uint32_t ov, uint32_t search)
         return true;
     }
     const float* fa       = a.Frame(p - ov);
-    uint32_t     best     = 0;
-    double       best_err = 0.0;
-    for(uint32_t i = 0; i < search; i++)
-    {
-        const float* fb  = b.Frame(i);
-        double       err = 0.0;
-        for(uint32_t j = 0; j < ov * kChannels; j++)
-        {
-            double d = static_cast<double>(fb[j]) - fa[j];
-            err += d * d;
-        }
-        if(i == 0 || err < best_err)
-        {
-            best_err = err;
-            best     = i;
-        }
-    }
+    const uint32_t best = BestMatch(b.d, fa, ov * kChannels, search);
     float*       xa   = a.Frame(p - ov);
     const float* xb   = b.Frame(best);
     const double step = kPi / ov;
+    const double cs = std::cos(step), sn = std::sin(step);
+    double       co = 1.0, si = 0.0; // cos/sin(i * step) by rotation
     for(uint32_t i = 0; i < ov; i++)
     {
-        double fin = 0.5 - 0.5 * std::cos(i * step);
+        double fin = 0.5 - 0.5 * co;
+        double nc  = co * cs - si * sn;
+        si         = si * cs + co * sn;
+        co         = nc;
         for(int c = 0; c < kChannels; c++)
         {
             double v = xa[i * kChannels + c] * (1.0 - fin) + xb[i * kChannels + c] * fin;
@@ -560,23 +630,7 @@ void Tempo(const Buf& in, Buf& out, double factor, uint32_t max_out)
         }
         else
         {
-            float least = 0.0f;
-            offset      = 0;
-            for(uint32_t i = 0; i < search; i++)
-            {
-                const float* a    = &g_tp_win[i * 2];
-                float        diff = 0.0f;
-                for(uint32_t j = 0; j < ov * kChannels; j++)
-                {
-                    float d = a[j] - g_tp_overlap[j];
-                    diff += d * d;
-                }
-                if(i == 0 || diff < least)
-                {
-                    least  = diff;
-                    offset = i;
-                }
-            }
+            offset = BestMatch(g_tp_win, g_tp_overlap, ov * kChannels, search);
             const float step = 1.0f / static_cast<float>(ov);
             for(uint32_t i = 0; i < ov; i++)
             {
@@ -614,10 +668,11 @@ void Resample(const Buf& in, Buf& out, double step, uint32_t out_frames)
     if(out_frames > out.cap)
         out_frames = out.cap;
     const double cutoff = (step > 1.0 ? 1.0 / step : 1.0) * kBandEdge;
+    const float  ck     = static_cast<float>(cutoff * kOver);
     for(uint32_t j = 0; j < out_frames; j++)
     {
         float l, r;
-        ResamplePoint(in, j * step, cutoff, l, r);
+        ResamplePoint(in, j * step, cutoff, ck, l, r);
         float* o = out.Frame(j);
         o[0]     = ClipF(l);
         o[1]     = ClipF(r);
@@ -629,10 +684,11 @@ void ResampleToI16(const Buf& in, int16_t* out, double step, uint32_t out_frames
 {
     BuildKernel();
     const double cutoff = (step > 1.0 ? 1.0 / step : 1.0) * kBandEdge;
+    const float  ck     = static_cast<float>(cutoff * kOver);
     for(uint32_t j = 0; j < out_frames; j++)
     {
         float l, r;
-        ResamplePoint(in, j * step, cutoff, l, r);
+        ResamplePoint(in, j * step, cutoff, ck, l, r);
         out[j * 2]     = ToI16(l);
         out[j * 2 + 1] = ToI16(r);
     }
