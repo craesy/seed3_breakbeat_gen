@@ -33,6 +33,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <strings.h>
 
@@ -722,6 +723,37 @@ mbb::Params GenParams(bool pots)
     return p;
 }
 
+// Focus mode: prints the pots (0..100) and the probabilities they give D16,
+// on entering (`now`) and whenever a pot moves by 2 or more.
+void ShowPots(bool now)
+{
+    static int      shown[4] = {-100, -100, -100, -100};
+    static uint32_t last     = 0;
+    const uint32_t  t        = System::GetNow();
+    if(!g_pots_ready || (!now && t - last < 150))
+        return;
+    float x[4];
+    int   v[4];
+    bool  moved = now;
+    for(int f = 0; f < 4; f++)
+    {
+        x[f]  = Pot(f);
+        v[f]  = static_cast<int>(x[f] * 100 + 0.5f);
+        moved = moved || std::abs(v[f] - shown[f]) >= 2;
+    }
+    if(!moved)
+        return;
+    std::copy(v, v + 4, shown);
+    last          = t;
+    mbb::Params p = settings.gen;
+    mbb::ApplyPots(p, x);
+    auto r = [](double d) { return static_cast<int>(d + 0.5); };
+    Log("pots D19 %d D20 %d D21 %d D22 %d: dev %d kick %d snare %d, stutter %d trunc %d, "
+        "reverse %d pitch %d half %d, reverb %d stretch %d",
+        v[0], v[1], v[2], v[3], r(p.p_deviation), r(p.p_kick), r(p.p_snare), r(p.p_stutter),
+        r(p.p_trunc), r(p.p_reverse), r(p.p_pitch), r(p.p_half), r(p.p_reverb), r(p.p_stretch));
+}
+
 // D17: a new loop from the break loaded, played from the next beat.
 bool Generate()
 {
@@ -854,6 +886,7 @@ void StartFocus(int q)
         g_focus_q = static_cast<int8_t>(q);
     }
     Log("focus on quarter %d (%d beats)", q + 1, g_f.Q);
+    ShowPots(true);
 }
 
 void EndFocus()
@@ -1048,6 +1081,8 @@ int main(void)
             }
             Run(e & 3, e >> 4, steps);
         }
+        if(g_focus_q >= 0)
+            ShowPots(false);
         System::Delay(1);
     }
 }

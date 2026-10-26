@@ -91,6 +91,9 @@ LED is lit; it blinks fast while D16 is making a new version.
 **USB log:** every action is printed, e.g. `focus on quarter 2 (16 beats)`,
 `quarter 2 version 3 (pots 50 80 10 50) in 640 ms` (pot positions 0–100) and
 `back to the loop, with the new quarter 2`.
+In focus mode the log also shows the pots when focus starts and whenever one
+moves (at most about 7 times a second), with the probabilities D16 would use:
+`pots D19 0 D20 35 D21 100 D22 12: dev 10 kick 50 snare 20, stutter 48 trunc 19, ...`.
 **Pot not responding:** if its number stays put while you turn it, its wiper
 or 3V3/GND isn't connected.
 
@@ -166,8 +169,8 @@ saves about 9 KB.
 
 | | used | of |
 |---|---|---|
-| FLASH | 121,324 B | 131,072 B (92.6%) |
-| SRAM (AXI/D2) | 243,064 B | 524,288 B |
+| FLASH | 121,912 B | 131,072 B (93.0%) |
+| SRAM (AXI/D2) | 243,096 B | 524,288 B |
 | SDRAM | 66,280,000 B | 67,108,864 B: 49.0 MB engine + 2 × 45 s play buffers |
 
 **USB log:** connect to the Seed's USB serial port (for example
@@ -316,5 +319,5 @@ SD. Audio keeps playing while it generates.
 - **Loops:** up to 40 s at the break's tempo and 45 s at the output tempo.
   `beats` is reduced to fit.
 - **Saved beats:** up to 512 in `/MBB/OUT`.
-- **Memory:** uses all but about 0.8 MB of SDRAM, and about 9.5 KB of flash is left.
+- **Memory:** uses all but about 0.8 MB of SDRAM, and about 9 KB of flash is left.
   Keep everything else at `-Os`.
