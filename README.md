@@ -27,6 +27,9 @@ external tools, then checks the result against the original sample-for-sample.
 | D1–D6 | micro-SD socket | D1 DAT3, D2 DAT2, D3 DAT1, D4 DAT0, D5 CMD, D6 CLK |
 | Audio out L/R | | stereo out, 48 kHz |
 
+**Tie AGND to DGND** (Seed pins 20 and 40). The Seed doesn't join them, and
+with them apart the pots read wrong values.
+
 Buttons use the internal pull-ups. The SD card needs 10–47 k pull-ups to 3V3
 on CMD and DAT0–3; most micro-SD breakout boards already have them. Avoid
 boards with 5 V level shifters. The button and pot pins match the
@@ -95,7 +98,8 @@ In focus mode the log also shows the pots when focus starts and whenever one
 moves (at most about 7 times a second), with the probabilities D16 would use:
 `pots D19 0 D20 35 D21 100 D22 12: dev 10 kick 50 snare 20, stutter 48 trunc 19, ...`.
 **Pot not responding:** if its number stays put while you turn it, its wiper
-or 3V3/GND isn't connected.
+or 3V3/GND isn't connected. If the numbers are wrong or jumpy, check that
+AGND and DGND are tied together.
 
 ## SD card
 
