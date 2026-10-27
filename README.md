@@ -82,10 +82,10 @@ when you press D16, and with `kPots = false` D16 uses `config.txt` as it is.
 D17 and D18 use `config.txt` as it is.
 
 **LED (on the Seed):**
-- **Slow blink:** booting or busy (analysing, generating, loading).
+- **On:** a loop is being made: the 16-bar loop (start-up, D17, D18, including
+  loading the break) or a new version of the quarter in focus (D16).
 - **Fast blink:** error. Check the USB log.
-- **Flashes on every beat** while playing, with a longer flash at the start of the loop.
-- **Off:** nothing loaded.
+- **Off:** otherwise (playing, or nothing loaded).
 
 **Quarter LEDs (D23, D24, D25, D28):** the LED of the quarter being played is
 lit, so they step 1 → 2 → 3 → 4 round the loop. In focus only that quarter's
@@ -173,7 +173,7 @@ saves about 9 KB.
 
 | | used | of |
 |---|---|---|
-| FLASH | 121,912 B | 131,072 B (93.0%) |
+| FLASH | 121,880 B | 131,072 B (93.0%) |
 | SRAM (AXI/D2) | 243,096 B | 524,288 B |
 | SDRAM | 66,280,000 B | 67,108,864 B: 49.0 MB engine + 2 × 45 s play buffers |
 

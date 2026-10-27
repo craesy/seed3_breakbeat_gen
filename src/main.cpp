@@ -13,6 +13,7 @@
 //   D18  next break in /MBB/SAMPLES and a new beat from it (not in focus)
 //   D19..D22 pots, for D16: shuffle, stutter, pitch, space (fully left = config)
 //   D23, D24, D25, D28 LEDs: quarter playing, or in focus (blinks while D16 works)
+//   Seed LED: on while a loop or quarter is being made, fast blink on errors
 //
 // SD card: /MBB/config.txt, /MBB/SAMPLES/*.wav, /MBB/kick.wav,
 // /MBB/snare.wav, generated beats are written to /MBB/OUT/<bpm>_<n>.wav.
@@ -358,10 +359,8 @@ void UpdateLed()
     {
         case UiState::Error: on = (now / 60) & 1; break;
         case UiState::Boot:
-        case UiState::Busy: on = (now / 150) & 1; break;
-        default: // flash on every beat, longer on the "one"
-            on = g_player.active() >= 0
-                 && g_player.since_tick() < (g_player.last_tick_restarted() ? 7200u : 1920u);
+        case UiState::Busy: on = true; break; // loading a break or making a loop
+        default: on = g_regen;                // D16 making a new quarter
     }
     hw.SetLed(on);
 
